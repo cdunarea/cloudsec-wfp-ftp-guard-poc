@@ -102,8 +102,14 @@ void FileScanner::ReadContent(HANDLE file, ULONGLONG deadline, ScanResult& resul
 }
 
 void FileScanner::Inspect(HANDLE file, ULONGLONG deadline, ScanResult& result) {
+    SetLastError(ERROR_SUCCESS);
     const DWORD type = GetFileType(file);
-    if (type == FILE_TYPE_UNKNOWN) { Incomplete(result, "GetFileType", GetLastError()); return; }
+    if (type == FILE_TYPE_UNKNOWN) {
+        const DWORD error = GetLastError();
+        // Device handles can have an unknown type without an API failure.
+        if (error != ERROR_SUCCESS) { Incomplete(result, "GetFileType", error); }
+        return;
+    }
     if (type != FILE_TYPE_DISK) { return; }
     FILE_STANDARD_INFO info{};
     if (!GetFileInformationByHandleEx(file, FileStandardInfo, &info, sizeof(info))) { Incomplete(result, "FileStandardInfo", GetLastError()); return; }

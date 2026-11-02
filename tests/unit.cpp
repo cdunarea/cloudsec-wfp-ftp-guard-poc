@@ -126,6 +126,15 @@ class Tests {
         FILETIME created{}, exited{}, kernel{}, user{};
         if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) { throw std::runtime_error("unit process creation time"); }
         const auto process_created = (static_cast<std::uint64_t>(created.dwHighDateTime) << 32) | created.dwLowDateTime;
+        guard::WinHandle device(CreateFileW(L"\\\\.\\Nsi", 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr));
+        if (!device.Valid()) { throw std::runtime_error("unit network device handle"); }
+        SetLastError(ERROR_SUCCESS);
+        Check(GetFileType(device.Get()) == FILE_TYPE_UNKNOWN && GetLastError() == ERROR_SUCCESS,
+              "real non-disk device has a valid unknown file type");
+        SetLastError(ERROR_ACCESS_DENIED);
+        const auto device_result = scanner.InspectFile(device.Get());
+        Check(device_result.verdict == guard::ScanVerdict::Clear && device_result.files == 0 && device_result.bytes == 0,
+              "non-disk device is ignored even with a stale last-error value");
         {
             const auto path = root / L"mY-SeCrEt-name.txt";
             guard::WinHandle file(CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, CREATE_NEW, 0, nullptr));

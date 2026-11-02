@@ -24,7 +24,7 @@ struct Segment {
     SIZE_T length;
     UINT32 flags;
     volatile LONG completions;
-    volatile LONG failed;
+    volatile LONG status;
     KEVENT completed;
 };
 struct Flow {
@@ -169,7 +169,7 @@ class Driver {
         flow->event.flow = flow->id;
         flow->event.process_id = metadata->processId;
         LARGE_INTEGER captured;
-        KeQuerySystemTime(&captured);
+        KeQuerySystemTimePrecise(&captured);
         flow->event.captured_at = static_cast<UINT64>(captured.QuadPart);
         FillEndpoint(flow->event, values, ipv6);
         KIRQL irql;
@@ -297,20 +297,34 @@ class Driver {
     }
     static void NTAPI InjectionComplete(void* context, NET_BUFFER_LIST* buffers, BOOLEAN) {
         auto* segment = static_cast<Segment*>(context);
-        if (!NT_SUCCESS(NET_BUFFER_LIST_STATUS(buffers))) { InterlockedExchange(&segment->failed, 1); }
+        const auto status = static_cast<NTSTATUS>(NET_BUFFER_LIST_STATUS(buffers));
+        if (!NT_SUCCESS(status)) { InterlockedCompareExchange(&segment->status, status, STATUS_SUCCESS); }
         FwpsFreeCloneNetBufferList0(buffers, 0);
         if (InterlockedDecrement(&segment->completions) == 0) { KeSetEvent(&segment->completed, IO_NO_INCREMENT, FALSE); }
     }
-    static bool Inject(Flow* flow, Segment* segment) {
+    static NTSTATUS Inject(Flow* flow, Segment* segment) {
+        KIRQL irql;
+        KeAcquireSpinLock(&flow->lock, &irql);
+        const bool closed = flow->verdict == Verdict::Closed;
+        KeReleaseSpinLock(&flow->lock, irql);
+        if (closed) { Discard(segment); return STATUS_CANCELLED; }
         for (auto* buffer = segment->buffers; buffer != nullptr; buffer = NET_BUFFER_LIST_NEXT_NBL(buffer)) { ++segment->completions; }
         const bool has_buffers = segment->buffers != nullptr;
         const NTSTATUS status = FwpsStreamInjectAsync0(state.injection, nullptr, 0, flow->handle, flow->callout, flow->layer,
             segment->flags, segment->buffers, segment->length, InjectionComplete, segment);
-        if (!NT_SUCCESS(status)) { QueueEvent(flow, guard::EventKind::Error, static_cast<ULONG>(status)); Discard(segment); return false; }
+        if (!NT_SUCCESS(status)) { Discard(segment); return status; }
         if (has_buffers) { KeWaitForSingleObject(&segment->completed, Executive, KernelMode, FALSE, nullptr); }
-        const bool success = segment->failed == 0;
+        const auto completion_status = static_cast<NTSTATUS>(segment->status);
         ExFreePoolWithTag(segment, kTag);
-        return success;
+        return completion_status;
+    }
+    static void InjectionFailed(Flow* flow, NTSTATUS status) {
+        KIRQL irql;
+        KeAcquireSpinLock(&flow->lock, &irql);
+        const bool closed = flow->verdict == Verdict::Closed;
+        if (!closed) { flow->verdict = Verdict::Block; }
+        KeReleaseSpinLock(&flow->lock, irql);
+        if (!closed) { QueueEvent(flow, guard::EventKind::Error, static_cast<ULONG>(status)); }
     }
     static void Announce(Flow* flow) {
         if (flow->announced) { return; }
@@ -357,12 +371,8 @@ class Driver {
             }
             KeReleaseSpinLock(&flow->lock, irql);
             if (segment == nullptr) { return; }
-            if (!Inject(flow, segment)) {
-                KeAcquireSpinLock(&flow->lock, &irql);
-                if (flow->verdict != Verdict::Closed) { flow->verdict = Verdict::Block; }
-                KeReleaseSpinLock(&flow->lock, irql);
-                QueueEvent(flow, guard::EventKind::Error, static_cast<ULONG>(STATUS_UNSUCCESSFUL));
-            }
+            const NTSTATUS status = Inject(flow, segment);
+            if (!NT_SUCCESS(status)) { InjectionFailed(flow, status); return; }
         }
     }
     static ULONG Snapshot(Flow** batch) {
