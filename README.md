@@ -17,31 +17,43 @@ temporary WFP filters, and drains/unloads the driver on normal exit or Ctrl+C.
 ## Design overview
 
 ```mermaid
+---
+config:
+  htmlLabels: false
+  fontFamily: Arial, sans-serif
+  themeVariables:
+    fontSize: 14px
+  flowchart:
+    htmlLabels: false
+    useMaxWidth: true
+    nodeSpacing: 30
+    rankSpacing: 45
+---
 flowchart TB
-    App["Client application<br/>Real client or ftp-traffic.exe"]
-    Driver["WfpFtpGuard.sys - kernel mode<br/>Outbound IPv4/IPv6 TCP on any port<br/>FTP probe, hold, reinject or abort"]
-    Peer["FTP / SFTP / other TCP server<br/>Real server or synthetic test stub"]
-    Console["ftp-guard.exe - elevated console<br/>NetDriverSession: lifecycle, filters, IOCTLs"]
-    Scan["FileScanner - file-scanner.lib<br/>Snapshot and inspect process open files<br/>Secret or incomplete: block; clear: allow"]
-    ETW["Optional ETW - observation only<br/>TCP/IP: PID + endpoints, no payload<br/>WinINet: FTP API intent, when emitted"]
-    Join["TCP/IP ETW - WFP correlation<br/>PID + full connection tuple<br/>Bounded 30-second cache"]
-    Log["Console diagnostics<br/>App details, FTP evidence, rule, outcome"]
-    Tests["guard-tests.exe<br/>Shared probe, matcher and scanner tests<br/>No live kernel or ETW validation"]
+    App["Client application<br/>Real client or<br/>ftp-traffic.exe"]
+    Driver["WfpFtpGuard.sys<br/>Kernel WFP callouts<br/>IPv4 / IPv6, any TCP port<br/>FTP probe / hold<br/>Reinject / abort"]
+    Peer["TCP server<br/>FTP / SFTP / other<br/>Real server or test stub"]
+    Console["ftp-guard.exe<br/>Elevated console<br/>NetDriverSession<br/>Driver / filters / IOCTLs"]
+    Scan["FileScanner<br/>file-scanner.lib<br/>Inspect open file handles<br/>Secret / incomplete: block<br/>Clear: allow"]
+    ETW["Optional ETW<br/>TCP/IP: PID + endpoints<br/>No payload inspection<br/>WinINet: FTP API intent<br/>When emitted"]
+    Join["TCP/IP ETW + WFP<br/>Match PID + full tuple<br/>30-second cache"]
+    Log["Console diagnostics<br/>App / flow / FTP evidence<br/>Policy / driver outcome"]
+    Tests["guard-tests.exe<br/>Probe / matcher / scanner<br/>No live kernel / ETW"]
 
     App <-->|"TCP"| Driver
     Driver <-->|"Stream bytes"| Peer
-    Driver -->|"Flow / FTP / result events"| Console
-    Console -->|"SCM + temporary filters"| Driver
-    Console -->|"FTP: inspect PID"| Scan
-    App -. "Open file handles" .-> Scan
-    Scan -->|"Allow / block IOCTL"| Driver
-    Console -. "WFP flow identity" .-> Join
-    ETW -. "TCP observation" .-> Join
-    ETW -. "TCP candidates / API intent" .-> Log
-    Join -. "Matched WFP flow ID" .-> Log
-    Console -->|"Connection and driver events"| Log
-    Scan -->|"Rule and scan statistics"| Log
-    Tests -. "User-mode tests" .-> Scan
+    Driver -->|"Flow / FTP / result"| Console
+    Console -->|"Driver + filters"| Driver
+    Console -->|"FTP: scan PID"| Scan
+    App -. "Open handles" .-> Scan
+    Scan -->|"Allow / block"| Driver
+    Console -. "WFP identity" .-> Join
+    ETW -. "TCP metadata" .-> Join
+    ETW -. "Candidates / API intent" .-> Log
+    Join -. "Flow ID" .-> Log
+    Console -->|"Connection / outcome"| Log
+    Scan -->|"Rule / scan stats"| Log
+    Tests -. "Unit tests" .-> Scan
 
     classDef traffic fill:#e9f6ef,stroke:#287a50,color:#163d29;
     classDef kernel fill:#fff1cf,stroke:#ad7500,color:#493300,stroke-width:2px;
