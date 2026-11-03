@@ -62,6 +62,78 @@ rechecks; they are not 17 distinct connections. Nine native control flows
 correlated by PID and full tuple. Aggregate ETW counters can include other
 applications; the WinINet FTP-intent count remained zero.
 
+### What happens during ftp.exe client interactions with SFTPGo
+
+**The PoC allows the FTP session to start, then pauses recognized FTP commands to inspect the client’s local files. An initial allow does not authorize every later upload.**
+
+In our tests, `ftp.exe` connected to SFTPGo’s **plain FTP listener**, on port **21 or 49237**. FTP uses a control connection for commands/replies and a separate data connection for file bytes. The tests used active mode, where SFTPGo connects back to the client for data transfer. [FTP specification](https://www.rfc-editor.org/rfc/rfc959)
+
+1. **`ftp.exe` opens the control connection.**
+
+   `Driver` records the application PID, executable path and connection endpoints. SFTPGo sends its greeting. At TCP establishment, the PoC has not yet identified the application protocol.
+
+2. **The initial FTP command triggers the first inspection.**
+
+   In the recorded native-client runs, `FtpProbe` recognized **`OPTS`**. The driver held that command and notified `Console`.
+
+   At this point, ordinary `ftp.exe` had not opened the upload source. The scan found no secret file, so the console returned **ALLOW**, and the driver released the command.
+
+3. **Login and transfer setup proceed.**
+
+   The client authenticates using `USER`/`PASS`. Our test selected binary transfer mode. The session then remains available for upload commands.
+
+4. **A `put` causes a fresh upload inspection.**
+
+   For example:
+
+   ```text
+   put quarterly.txt remote.dat
+   ```
+
+   `put` selects a local file and a remote filename. On the FTP connection, the client requests storage using **`STOR remote.dat`**. `FtpUploadProbe` detects that command and the driver holds it before delivering it to SFTPGo. [Windows `ftp put`](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/ftp-put)
+
+5. **The console checks the local files.**
+
+   There is a significant native-client detail: `ftp.exe` briefly opens its source before `STOR`, closes that probe handle, and reopens it after server acceptance. An instantaneous handle scan at `STOR` can therefore miss it.
+
+   Combined mode handles the tested gap by flushing ETW, waiting for buffer delivery through `NetTraceProgress`, and obtaining recent file-open paths from `NetFileActivityCache`. `FileScanner` checks both current handles and those recent paths. It checks filenames and uses `SecretMatcher` to inspect local file content.
+
+```mermaid
+sequenceDiagram
+    participant C as ftp.exe
+    participant W as WFP driver
+    participant G as Guard console
+    participant S as SFTPGo
+
+    C->>W: STOR remote.dat
+    W->>G: Inspect this PID and flow
+    Note over C,W: Upload command is held
+    G->>G: Collect ETW evidence and scan files
+    G-->>W: Allow or block
+    alt Clear
+        W->>S: Release STOR
+        S-->>C: Accept transfer
+        C->>S: File bytes over data connection
+    else Secret match or incomplete inspection
+        W-->>C: Abort control flow
+        Note over S: Held STOR is not delivered
+    end
+```
+
+6. **The decision determines whether the upload proceeds.**
+
+   If clear, SFTPGo receives `STOR` and the transfer proceeds. If a secret filename/content matches—or inspection is incomplete—the driver aborts the control flow. In the denied tests, the destination file was absent.
+
+The same-session test makes the behavior particularly clear. **Flow 9, PID 4684** followed this progression:
+
+```text
+OPTS  → ALLOW
+STOR  → ALLOW   — public upload; server-side hash matched
+STOR  → BLOCK   — quarterly.txt matched secret-content; destination absent
+```
+
+The PoC identifies FTP from control-stream bytes and evaluates the **local files**. It does not search the transferred network payload for `secret`. An unrelated open or recently opened file can also cause a block.
+
 ### Independent real FTP/SFTP checks
 
 | Check group | Cases | Verified result |
