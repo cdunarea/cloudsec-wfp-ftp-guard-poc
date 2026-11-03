@@ -62,6 +62,55 @@ flowchart TB
 Blue boxes are components of the console process. Dashed arrows carry evidence
 or test relationships. File policy runs in user mode; WFP enforces its result.
 
+## Classes and binary ownership
+
+`Console` coordinates the file-policy decision, and `Driver` enforces it on the
+connection. File enumeration and content scanning run in user mode. For static
+classes such as `Console`, `Driver`, and `Diagnostics`, the binary column
+identifies where the code runs; no class instance is created.
+
+| Class | What it does | Binary that owns/uses it |
+| --- | --- | --- |
+| **`Console`** - `console/main.cpp` | Application entry point and coordinator. Parses options, starts the driver session and ETW monitor, processes driver events, requests file inspection, sends allow/block decisions, and handles shutdown. | `ftp-guard.exe` |
+| **`NetDriverSession`** | Owns the console's connection to the driver. Loads the `.sys` through Windows services, installs temporary WFP filters, opens the driver device, exchanges IOCTL messages, and drains/unloads everything during cleanup. | `ftp-guard.exe` |
+| **`Driver`** - `driver/driver.cpp` | Kernel-side implementation. Registers WFP callouts, associates connections with processes, inspects TCP stream bytes, holds commands pending inspection, reinjects allowed data, and aborts blocked flows. Also manages queues, timeouts, injection completion and connection teardown. | `WfpFtpGuard.sys` |
+| **`FtpProbe`** | Recognizes the initial plaintext FTP exchange from greeting and command bytes. Handles fragmented input and returns `Unknown`, `Ftp`, or `Other`. It uses a bounded parser without dynamic allocation, so it can run inside the driver. | `WfpFtpGuard.sys` - one per tracked flow; `guard-tests.exe` - parser tests |
+| **`FtpUploadProbe`** | Watches subsequent commands on a confirmed FTP connection. Detects `STOR`, `APPE`, and `STOU` so an earlier allow does not authorize every later upload. Reuses `FtpProbe`'s command parsing and stops plaintext inspection after `AUTH TLS`. | `WfpFtpGuard.sys` - one per tracked flow; `guard-tests.exe` - parser tests |
+| **`FileScanner`** | Examines the originating process's open disk-file handles and supplied recent-file paths. Checks process creation time to guard against PID reuse, checks filenames, reads content with independent offsets, and returns a clear, secret-name, secret-content, or incomplete result. | `ftp-guard.exe` and `guard-tests.exe`, through `file-scanner.lib` |
+| **`SecretMatcher`** | Searches content chunks for case-insensitive `secret` byte patterns in ASCII/UTF-8 and UTF-16 LE/BE. Retains partial matches between chunks, so a match can cross a read boundary. It performs matching only; `FileScanner` opens and reads files. | `ftp-guard.exe` and `guard-tests.exe` |
+| **`EtwMonitor`** | Owns the ETW sessions and consumer threads. Collects TCP connection metadata, optional WinINet FTP intent, and file-open events. Correlates TCP observations with WFP flows and supplies recent-file evidence at upload gates. It also flushes the trace and checks delivery completeness. | `ftp-guard.exe` |
+| **`NetFileActivityCache`** | Stores up to 1,024 file-open records. Returns deduplicated paths for the requested PID, opened since the connection began and within the last 30 seconds. It stores evidence of opens, rather than keeping file handles alive. | `ftp-guard.exe` - owned by `EtwMonitor`; `guard-tests.exe` - cache tests |
+| **`NetTraceProgress`** | Synchronizes ETW delivery using a mutex, condition variable, consumed-buffer counter and completion flag. Inspection waits for the required buffer count, consumer shutdown, or timeout. This replaces the guessed fixed sleep; inspection remains serial. | `ftp-guard.exe` - owned by each ETW session; `guard-tests.exe` - synchronization tests |
+| **`Diagnostics`** | Formats connection/application details, converts strings and addresses, and writes synchronized console messages. It produces the application blobs visible in the screenshots. | `ftp-guard.exe` |
+| **`WinHandle`** | Move-only owner of a Windows `HANDLE`. Automatically closes process, file, token and event handles when their owners leave scope. | `ftp-guard.exe` and `guard-tests.exe` |
+
+The test executables contain three additional classes:
+
+| Class | What it does | Binary that owns/uses it |
+| --- | --- | --- |
+| **`Traffic`** - `tests/traffic.cpp` | Implements `ftp-traffic.exe`: the synthetic client and minimal loopback server used for protocol, fragmentation, IPv6, HTTP and controlled open-file tests. | `ftp-traffic.exe` |
+| **`Traffic::Socket`** | Private socket owner that automatically calls `closesocket`. | `ftp-traffic.exe` |
+| **`Tests`** - `tests/unit.cpp` | Runs `guard-tests.exe`: parser, matcher, cache, synchronization and real Windows file-handle regression tests. | `guard-tests.exe` |
+
+`file-scanner.lib` is a static library: its code becomes part of the consuming
+executable. Classes used by multiple binaries have independent instances in each
+process.
+
+The shared protocol types are data records:
+
+- **`NetEventKind`** identifies flow, inspection, allow, block, error and closed-flow notifications.
+- **`NetEvent`** carries a notification, process identity, endpoints and command evidence.
+- **`NetDecision`** carries the console's allow/block reply for a flow.
+- **`NetStatus`** carries driver counters and operating state.
+
+For an ordinary `ftp.exe` upload, the interaction is:
+
+1. `Driver` uses `FtpProbe` to identify FTP and `FtpUploadProbe` to catch `STOR`.
+2. `Console` receives the inspection request through `NetDriverSession`.
+3. `EtwMonitor`, `NetTraceProgress` and `NetFileActivityCache` supply the recent-file evidence.
+4. `FileScanner` checks current handles and recent paths, using `SecretMatcher` for content.
+5. `Console` sends the decision through `NetDriverSession`; `Driver` releases or aborts the flow, and the console reports the outcome.
+
 ## Run and modes
 
 After [building and signing](TEST_RESULTS.md#build-and-test-instructions), run elevated:
