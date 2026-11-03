@@ -105,11 +105,13 @@ class Console {
         }
     }
     static void Handle(guard::NetDriverSession& driver, guard::EtwMonitor& etw, const guard::NetEvent& event) {
-        if (event.kind == guard::EventKind::Flow) { guard::Diagnostics::Connection("WFP", event); etw.DriverConnection(event); return; }
-        if (event.kind == guard::EventKind::InspectFtp) { Inspect(driver, etw, event); return; }
-        const char* kind = event.kind == guard::EventKind::Blocked ? "BLOCKED" : event.kind == guard::EventKind::Allowed ? "ALLOWED" : "ERROR";
+        if (event.kind == guard::NetEventKind::Flow) { guard::Diagnostics::Connection("WFP", event); etw.DriverConnection(event); return; }
+        if (event.kind == guard::NetEventKind::InspectFtp) { Inspect(driver, etw, event); return; }
+        const char* kind = event.kind == guard::NetEventKind::Blocked ? "BLOCKED" : event.kind == guard::NetEventKind::Allowed ? "ALLOWED" :
+                           event.kind == guard::NetEventKind::Closed ? "CLOSED" : "ERROR";
         guard::Diagnostics::Line(std::string("[DRIVER ") + kind + "] flow=" + std::to_string(event.flow) + " pid=" +
-            std::to_string(event.process_id) + " detail=" + std::to_string(event.detail));
+            std::to_string(event.process_id) + " detail=" + std::to_string(event.detail) +
+            (event.kind == guard::NetEventKind::Error || event.kind == guard::NetEventKind::Closed ? " context=" + std::string(event.evidence) : ""));
     }
     static void Inspect(guard::NetDriverSession& driver, guard::EtwMonitor& etw, const guard::NetEvent& event) {
         guard::Diagnostics::Line("[FTP CONFIRMED] flow=" + std::to_string(event.flow) + " pid=" + std::to_string(event.process_id) +

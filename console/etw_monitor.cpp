@@ -152,7 +152,7 @@ UINT64 EtwMonitor::FileTimeNow() {
     return (static_cast<UINT64>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
 }
 NetFileEvidence EtwMonitor::RecentFiles(const NetEvent& event) {
-    if (!file_history_ || sessions_[0].controller == 0) { return {}; }
+    if (!file_history_ || sessions_[0].controller == 0 || sessions_[0].consumer == INVALID_PROCESSTRACE_HANDLE) { return {}; }
     auto& session = sessions_[0];
     auto storage = session.properties;
     auto* properties = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(storage.data());
@@ -204,7 +204,7 @@ void EtwMonitor::Record(EVENT_RECORD* record) {
     if (opcode != 12 && opcode != 28) { return; } // TcpIp Connect IPv4 / IPv6.
     NetEvent event{};
     event.version = kVersion;
-    event.kind = EventKind::Flow;
+    event.kind = NetEventKind::Flow;
     event.process_id = Number(record, L"PID");
     if (event.process_id == 0) { return; }
     const auto remote = Property(record, L"daddr");

@@ -17,10 +17,10 @@ inline constexpr ULONG kGetEvent = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_B
 inline constexpr ULONG kSetDecision = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_WRITE_ACCESS);
 inline constexpr ULONG kStop = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_WRITE_ACCESS);
 inline constexpr ULONG kStatus = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_READ_ACCESS);
-enum class EventKind : ULONG { Flow = 1, InspectFtp = 2, Allowed = 3, Blocked = 4, Error = 5 };
+enum class NetEventKind : ULONG { Flow = 1, InspectFtp = 2, Allowed = 3, Blocked = 4, Error = 5, Closed = 6 };
 struct NetEvent {
     ULONG version;
-    EventKind kind;
+    NetEventKind kind;
     UINT64 flow;
     UINT64 process_id;
     UINT64 process_created;

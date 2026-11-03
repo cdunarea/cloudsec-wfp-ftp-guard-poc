@@ -48,6 +48,7 @@ struct Flow {
     BOOLEAN inspection_sent;
     BOOLEAN abort_sent;
     BOOLEAN ftp_confirmed;
+    BOOLEAN closing;
 };
 struct EventNode { LIST_ENTRY link; guard::NetEvent event; };
 struct State {
@@ -122,12 +123,17 @@ class Driver {
     static void DiscardList(LIST_ENTRY* list) {
         while (!IsListEmpty(list)) { Discard(CONTAINING_RECORD(RemoveHeadList(list), Segment, link)); }
     }
-    static bool QueueEvent(Flow* flow, guard::EventKind kind, ULONG detail = 0) {
+    static bool QueueEvent(Flow* flow, guard::NetEventKind kind, ULONG detail = 0, const char* context = nullptr) {
         auto* node = static_cast<EventNode*>(ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(EventNode), kTag));
         if (node == nullptr) { return false; }
         node->event = flow->event;
         node->event.kind = kind;
         node->event.detail = detail;
+        if (context != nullptr) {
+            SIZE_T i = 0;
+            for (; i + 1 < sizeof(node->event.evidence) && context[i] != 0; ++i) { node->event.evidence[i] = context[i]; }
+            node->event.evidence[i] = 0;
+        }
         KIRQL irql;
         KeAcquireSpinLock(&state.events_lock, &irql);
         const bool room = state.event_count < 256;
@@ -248,7 +254,7 @@ class Driver {
         auto* data = packet->streamData;
         packet->streamAction = FWPS_STREAM_ACTION_NONE;
         packet->countBytesEnforced = data->dataLength;
-        if ((data->flags & (FWPS_STREAM_FLAG_SEND_ABORT | FWPS_STREAM_FLAG_RECEIVE_ABORT)) != 0) { return; }
+        if (TrackDisconnect(flow, data->flags)) { return; }
         if (data->dataLength == 0 && (data->flags & (FWPS_STREAM_FLAG_SEND_DISCONNECT | FWPS_STREAM_FLAG_RECEIVE_DISCONNECT)) == 0) { return; }
         auto* segment = static_cast<Segment*>(ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(Segment), kTag));
         if (segment == nullptr) { Drop(packet, result); return; }
@@ -281,6 +287,16 @@ class Driver {
         // Switching back to inline processing after an asynchronous decision violates WFP's contract.
         result->actionType = FWP_ACTION_BLOCK;
         KeSetEvent(&state.wake, IO_NO_INCREMENT, FALSE);
+    }
+    static bool TrackDisconnect(Flow* flow, UINT32 flags) {
+        const bool abort = (flags & (FWPS_STREAM_FLAG_SEND_ABORT | FWPS_STREAM_FLAG_RECEIVE_ABORT)) != 0;
+        if (!abort && (flags & (FWPS_STREAM_FLAG_SEND_DISCONNECT | FWPS_STREAM_FLAG_RECEIVE_DISCONNECT)) == 0) { return false; }
+        KIRQL irql;
+        KeAcquireSpinLock(&flow->lock, &irql);
+        flow->closing = TRUE;
+        if (abort) { flow->verdict = Verdict::Closed; }
+        KeReleaseSpinLock(&flow->lock, irql);
+        return abort;
     }
     static void Drop(FWPS_STREAM_CALLOUT_IO_PACKET0* packet, FWPS_CLASSIFY_OUT0* result) {
         packet->streamAction = FWPS_STREAM_ACTION_DROP_CONNECTION;
@@ -316,7 +332,8 @@ class Driver {
         FwpsFreeCloneNetBufferList0(buffers, 0);
         if (InterlockedDecrement(&segment->completions) == 0) { KeSetEvent(&segment->completed, IO_NO_INCREMENT, FALSE); }
     }
-    static NTSTATUS Inject(Flow* flow, Segment* segment) {
+    static NTSTATUS Inject(Flow* flow, Segment* segment, bool& submission_failed) {
+        submission_failed = false;
         KIRQL irql;
         KeAcquireSpinLock(&flow->lock, &irql);
         const bool closed = flow->verdict == Verdict::Closed;
@@ -326,19 +343,37 @@ class Driver {
         const bool has_buffers = segment->buffers != nullptr;
         const NTSTATUS status = FwpsStreamInjectAsync0(state.injection, nullptr, 0, flow->handle, flow->callout, flow->layer,
             segment->flags, segment->buffers, segment->length, InjectionComplete, segment);
-        if (!NT_SUCCESS(status)) { Discard(segment); return status; }
+        if (!NT_SUCCESS(status)) { submission_failed = true; Discard(segment); return status; }
         if (has_buffers) { KeWaitForSingleObject(&segment->completed, Executive, KernelMode, FALSE, nullptr); }
         const auto completion_status = static_cast<NTSTATUS>(segment->status);
         ExFreePoolWithTag(segment, kTag);
         return completion_status;
     }
-    static void InjectionFailed(Flow* flow, NTSTATUS status) {
+    static bool OriginExited(const Flow* flow) {
+        PEPROCESS process = nullptr;
+        const NTSTATUS lookup = PsLookupProcessByProcessId(reinterpret_cast<HANDLE>(flow->event.process_id), &process);
+        if (!NT_SUCCESS(lookup)) { return lookup == STATUS_INVALID_CID; }
+        const bool exited = PsGetProcessExitStatus(process) != STATUS_PENDING ||
+            static_cast<UINT64>(PsGetProcessCreateTimeQuadPart(process)) > flow->event.captured_at;
+        ObDereferenceObject(process);
+        return exited;
+    }
+    static void InjectionFailed(Flow* flow, NTSTATUS status, bool zero_fin, bool submission_failed) {
+        // A synchronous lookup failure means there is no stream left to inject
+        // into. Keep that terminal transport outcome distinct from policy blocks.
+        const bool origin_exited = status == STATUS_INVALID_DEVICE_STATE && OriginExited(flow);
         KIRQL irql;
         KeAcquireSpinLock(&flow->lock, &irql);
+        const bool unavailable = (submission_failed && status == STATUS_NOT_FOUND) ||
+                                 ((flow->closing || origin_exited) && status == STATUS_INVALID_DEVICE_STATE);
         const bool closed = flow->verdict == Verdict::Closed;
-        if (!closed) { flow->verdict = Verdict::Block; }
+        if (!closed) { flow->verdict = unavailable ? Verdict::Closed : Verdict::Block; }
         KeReleaseSpinLock(&flow->lock, irql);
-        if (!closed) { QueueEvent(flow, guard::EventKind::Error, static_cast<ULONG>(status)); }
+        const char* context = origin_exited ? "origin-exited-invalid-state" : zero_fin ? (submission_failed ? "fin-submit" : "fin-complete") :
+                                        (submission_failed ? "data-submit" : "data-complete");
+        if (!closed) {
+            QueueEvent(flow, unavailable ? guard::NetEventKind::Closed : guard::NetEventKind::Error, static_cast<ULONG>(status), context);
+        }
     }
     static void Announce(Flow* flow) {
         if (flow->announced) { return; }
@@ -349,7 +384,7 @@ class Driver {
             ObDereferenceObject(process);
         }
         flow->announced = TRUE;
-        QueueEvent(flow, guard::EventKind::Flow);
+        QueueEvent(flow, guard::NetEventKind::Flow);
     }
     static void Process(Flow* flow) {
         Announce(flow);
@@ -361,17 +396,17 @@ class Driver {
             }
             if (flow->verdict == Verdict::Waiting && !flow->inspection_sent) {
                 flow->inspection_sent = TRUE;
-                if (!QueueEvent(flow, guard::EventKind::InspectFtp)) { flow->verdict = Verdict::Block; }
+                if (!QueueEvent(flow, guard::NetEventKind::InspectFtp)) { flow->verdict = Verdict::Block; }
             }
             if (flow->verdict == Verdict::Waiting && Now() - flow->waiting_since > 15ULL * 10000000) {
                 flow->verdict = Verdict::Block;
-                QueueEvent(flow, guard::EventKind::Error, STATUS_TIMEOUT);
+                QueueEvent(flow, guard::NetEventKind::Error, STATUS_TIMEOUT);
             }
             if (flow->verdict == Verdict::Block && !flow->abort_sent) {
                 flow->abort_sent = TRUE;
                 KeReleaseSpinLock(&flow->lock, irql);
                 InterlockedIncrement64(&state.blocked);
-                QueueEvent(flow, guard::EventKind::Blocked);
+                QueueEvent(flow, guard::NetEventKind::Blocked);
                 FwpsFlowAbort0(flow->handle);
                 return;
             }
@@ -385,8 +420,11 @@ class Driver {
             }
             KeReleaseSpinLock(&flow->lock, irql);
             if (segment == nullptr) { return; }
-            const NTSTATUS status = Inject(flow, segment);
-            if (!NT_SUCCESS(status)) { InjectionFailed(flow, status); return; }
+            const bool zero_fin = segment->length == 0 &&
+                (segment->flags & (FWPS_STREAM_FLAG_SEND_DISCONNECT | FWPS_STREAM_FLAG_RECEIVE_DISCONNECT)) != 0;
+            bool submission_failed = false;
+            const NTSTATUS status = Inject(flow, segment, submission_failed);
+            if (!NT_SUCCESS(status)) { InjectionFailed(flow, status, zero_fin, submission_failed); return; }
         }
     }
     static ULONG Snapshot(Flow** batch) {
@@ -444,7 +482,7 @@ class Driver {
         const bool pending = target->verdict == Verdict::Waiting;
         if (pending) { target->verdict = decision.block ? Verdict::Block : Verdict::Allow; }
         KeReleaseSpinLock(&target->lock, irql);
-        if (pending && !decision.block) { InterlockedIncrement64(&state.allowed); QueueEvent(target, guard::EventKind::Allowed); }
+        if (pending && !decision.block) { InterlockedIncrement64(&state.allowed); QueueEvent(target, guard::NetEventKind::Allowed); }
         Release(target);
         KeSetEvent(&state.wake, IO_NO_INCREMENT, FALSE);
         return pending ? STATUS_SUCCESS : STATUS_INVALID_DEVICE_STATE;

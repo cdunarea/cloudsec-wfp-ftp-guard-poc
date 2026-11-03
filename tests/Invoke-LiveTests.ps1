@@ -83,7 +83,7 @@ try {
     Save-LiveState
     if (-not $guard.WaitForExit(45000)) { throw 'Driver console did not unload in time' }
     $guardLog = Get-Content -LiteralPath "$runRoot\guard.log" -Raw
-    if ($guardLog -notmatch '\[DRIVER SUMMARY\] ftp=13 blocked=8 allowed=5') { throw ('Unexpected driver totals: ' + $guardLog) }
+    if ($guardLog -notmatch '\[DRIVER SUMMARY\] (?:ftp_inspections|ftp)=13 (?:blocked_flows|blocked)=8 (?:allowed_decisions|allowed)=5') { throw ('Unexpected driver totals: ' + $guardLog) }
     if ($guardLog -notmatch '\[CORRELATED\]') { throw 'ETW and WFP correlation was not observed' }
     if ($guardLog -notmatch 'rule=secret-filename' -or $guardLog -notmatch 'rule=secret-content') { throw 'Required secret diagnostics were missing' }
     if ($guardLog -notmatch '\[DRIVER\] unloaded') { throw 'Driver unload diagnostic missing' }
