@@ -152,9 +152,16 @@ with narrower open-handle coverage and can miss this native-client source.
   control-byte heuristics. TCP establishment/greeting can precede identification.
   Existing connections, inbound-initiated flows, unusual/slow starts and protocol
   ambiguity remain outside reliable coverage.
-- SFTP, implicit FTPS and encrypted tunnels are not inspected as FTP. Explicit
+- SFTP and implicit FTPS are not inspected as FTP. Encrypted outer tunnel bytes
+  cannot be classified as FTP; the inner application stream may still be visible
+  before VPN encryption (see [coexistence](#kdf-vpn-and-wfp-coexistence)). Explicit
   `AUTH TLS` can be recognized before encryption; later encrypted commands cannot.
   Control/data channels are not linked, and network file payloads are not scanned.
+
+  Regarding SFTP - the key limitation is encryption: a network filter can
+  recognize SSH, but the request that specifically identifies SFTP travels
+  inside the encrypted session, so we cannot reliably distinguish SFTP from
+  regular SSH packets.
 - Raw file matching covers ASCII/UTF-8 and UTF-16 LE/BE patterns, without document
   parsing, archive unpacking or decryption. Only the filename is checked, excluding
   parent folders. Protected/unreadable/network files can cause conservative blocks.
@@ -175,6 +182,39 @@ matched filename/rule and accepted driver outcome. `DRIVER CLOSED` retains known
 transport-teardown status/context separately from policy blocks; other injection
 failures remain errors. An allow/close event alone does not prove an upload.
 Logs contain paths and should be sanitized before sharing.
+
+## KDF, VPN, and WFP coexistence
+
+WFP supports multiple inspection providers; installing Cisco KDF (the Secure
+Client socket interceptor) does not exclusively reserve network interception.
+An allow from another provider is not automatically an exemption from DLP
+blocking; WFP supports callout vetoes. However, registration alone does not
+guarantee callback delivery, plaintext visibility, correct process attribution,
+or enforcement. See Microsoft's [filter arbitration model](https://learn.microsoft.com/en-us/windows/win32/fwp/filter-arbitration).
+
+| Situation | Effect on FTP inspection |
+| --- | --- |
+| VPN encapsulates ordinary application TCP below the stream layer | The inner plaintext FTP stream should remain visible before tunnel encryption. Microsoft identifies TCP stream layers as [compatible with Windows IPsec](https://learn.microsoft.com/en-us/windows-hardware/drivers/network/developing-ipsec-compatible-callout-drivers); other VPN implementations require validation. |
+| KDF or another component redirects through a local proxy | The application-to-proxy and proxy-to-server connections are separate. Inspecting the wrong connection can attribute traffic to the proxy and break file correlation; preserve the original application and destination context. See [WFP redirection](https://learn.microsoft.com/en-us/windows-hardware/drivers/network/using-bind-or-connect-redirection). |
+| An earlier stream callout holds, modifies, or drops data | Stream inspection follows a [waterfall](https://learn.microsoft.com/en-us/windows-hardware/drivers/network/stream-inspection): downstream callouts inspect released/reinjected data, but permanently blocked segments do not reach them. |
+
+Cisco documents configurable socket-interceptor WFP sublayer weights specifically
+for coexistence with other WFP drivers and TCP redirection
+([CSCwo25750](https://www.cisco.com/c/en/us/td/docs/security/vpn_client/anyconnect/Cisco-Secure-Client-5/release/notes/release-notes-cisco-secure-client-5-1.html)).
+The PoC's chosen ordering has not been qualified against KDF.
+
+**Current PoC concern:** [FlowClassify](driver/driver.cpp) returns when
+`FWPS_RIGHT_ACTION_WRITE` is absent, before associating its flow context.
+Because stream callouts use `FWP_CALLOUT_FLAG_CONDITIONAL_ON_FLOW`, skipping that
+association can leave the connection uninspected. This is a potential coexistence
+blind spot to investigate, not a demonstrated KDF failure or a completed fix.
+
+Compatibility validation must inspect installed providers/layers/sublayer weights
+and repeat real FTP allow/block tests with KDF loaded: VPN disconnected/connected,
+applicable split/full tunnel and proxy modes, IPv4/IPv6, and reconnects. Require
+correct originating-process attribution and no uploaded destination file for
+blocked cases; seeing a callback alone is insufficient. Existing
+[live FTP results](TEST_RESULTS.md) do not establish KDF/VPN compatibility.
 
 See [TEST_RESULTS.md](TEST_RESULTS.md) for real end-to-end results, separate
 synthetic results, build/reproduction instructions and detailed test scope.
