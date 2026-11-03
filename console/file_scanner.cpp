@@ -130,7 +130,21 @@ ScanResult FileScanner::InspectFile(HANDLE file, DWORD budget_ms) const {
     return result;
 }
 
-ScanResult FileScanner::Scan(DWORD process_id, std::uint64_t process_created, DWORD budget_ms) const {
+void FileScanner::InspectRecent(const std::wstring& path, ULONGLONG deadline, ScanResult& result) {
+    std::wstring open = path;
+    if (path.rfind(L"\\Device\\HarddiskVolume", 0) == 0) { open = L"\\\\?\\GLOBALROOT" + path; }
+    else if (path.size() < 3 || path[1] != L':') { return; }
+    if (GetTickCount64() >= deadline) { Incomplete(result, "Recent-file scan deadline", ERROR_TIMEOUT); return; }
+    WinHandle file(CreateFileW(open.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+    if (!file.Valid()) { Incomplete(result, "Open recent file", GetLastError()); return; }
+    ++result.recent_files;
+    Inspect(file.Get(), deadline, result);
+    if (result.verdict == ScanVerdict::SecretName || result.verdict == ScanVerdict::SecretContent) { result.recent_match = true; }
+}
+
+ScanResult FileScanner::Scan(DWORD process_id, std::uint64_t process_created, DWORD budget_ms,
+                            const std::vector<std::wstring>& recent_files) const {
     ScanResult result;
     WinHandle process(OpenProcess(PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id));
     if (!process.Valid()) { Incomplete(result, "OpenProcess", GetLastError()); return result; }
@@ -169,6 +183,11 @@ ScanResult FileScanner::Scan(DWORD process_id, std::uint64_t process_created, DW
         }
         WinHandle file(raw);
         Inspect(file.Get(), deadline, result);
+        if (result.verdict == ScanVerdict::SecretName || result.verdict == ScanVerdict::SecretContent) { break; }
+    }
+    if (result.verdict == ScanVerdict::SecretName || result.verdict == ScanVerdict::SecretContent) { return result; }
+    for (const auto& path : recent_files) {
+        InspectRecent(path, deadline, result);
         if (result.verdict == ScanVerdict::SecretName || result.verdict == ScanVerdict::SecretContent) { break; }
     }
     return result;

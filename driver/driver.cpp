@@ -40,12 +40,14 @@ struct Flow {
     UINT16 layer;
     guard::NetEvent event;
     guard::FtpProbe probe;
+    guard::FtpUploadProbe uploads;
     Verdict verdict;
     UINT64 waiting_since;
     UINT64 probe_since;
     BOOLEAN announced;
     BOOLEAN inspection_sent;
     BOOLEAN abort_sent;
+    BOOLEAN ftp_confirmed;
 };
 struct EventNode { LIST_ENTRY link; guard::NetEvent event; };
 struct State {
@@ -165,6 +167,7 @@ class Driver {
         flow->callout = state.callouts[ipv6 ? 3 : 2];
         flow->layer = static_cast<UINT16>(ipv6 ? FWPS_LAYER_STREAM_V6 : FWPS_LAYER_STREAM_V4);
         flow->probe.Reset();
+        flow->uploads.Reset();
         flow->event.version = guard::kVersion;
         flow->event.flow = flow->id;
         flow->event.process_id = metadata->processId;
@@ -210,6 +213,32 @@ class Driver {
             RtlCopyMemory(event.local_address, &own, sizeof(own));
         }
     }
+    static void RequestInspection(Flow* flow, const char* verb) {
+        flow->verdict = Verdict::Waiting;
+        flow->waiting_since = Now();
+        flow->inspection_sent = FALSE;
+        InterlockedIncrement64(&state.detections);
+        ULONG i = 0;
+        while (verb[i] != '\0' && i + 1 < sizeof(flow->event.evidence)) { flow->event.evidence[i] = verb[i]; ++i; }
+        flow->event.evidence[i] = '\0';
+    }
+    static void InspectProtocol(Flow* flow, bool sending, const UCHAR* prefix, SIZE_T copied, UINT32 flags) {
+        const bool upload = sending && (flow->verdict == Verdict::Unknown || flow->ftp_confirmed) &&
+            flow->uploads.Feed(prefix, copied);
+        if (flow->verdict == Verdict::Unknown) {
+            const auto protocol = flow->probe.Feed(sending, prefix, copied);
+            if (protocol == guard::ProtocolVerdict::Other) { flow->verdict = Verdict::Allow; }
+            if (protocol == guard::ProtocolVerdict::Ftp) {
+                flow->ftp_confirmed = TRUE;
+                RequestInspection(flow, flow->probe.Verb());
+            }
+            if (flow->verdict == Verdict::Unknown && (flags & FWPS_STREAM_FLAG_SEND_DISCONNECT) != 0) {
+                flow->verdict = Verdict::Allow;
+            }
+        } else if (flow->verdict == Verdict::Allow && flow->ftp_confirmed && upload) {
+            RequestInspection(flow, flow->uploads.Verb());
+        }
+    }
     static void NTAPI StreamClassify(const FWPS_INCOMING_VALUES0*, const FWPS_INCOMING_METADATA_VALUES0*,
                                      void* layer_data, const FWPS_FILTER0*, UINT64 context, FWPS_CLASSIFY_OUT0* result) {
         auto* packet = static_cast<FWPS_STREAM_CALLOUT_IO_PACKET0*>(layer_data);
@@ -242,22 +271,7 @@ class Driver {
         if (!reject) {
             const bool sending = (data->flags & FWPS_STREAM_FLAG_SEND) != 0;
             if (sending && flow->probe_since == 0) { flow->probe_since = Now(); }
-            if (flow->verdict == Verdict::Unknown) {
-                const auto protocol = flow->probe.Feed(sending, prefix, copied);
-                if (protocol == guard::ProtocolVerdict::Other) { flow->verdict = Verdict::Allow; }
-                if (protocol == guard::ProtocolVerdict::Ftp) {
-                    flow->verdict = Verdict::Waiting;
-                    flow->waiting_since = Now();
-                    InterlockedIncrement64(&state.detections);
-                    const char* verb = flow->probe.Verb();
-                    ULONG i = 0;
-                    while (verb[i] != '\0' && i + 1 < sizeof(flow->event.evidence)) { flow->event.evidence[i] = verb[i]; ++i; }
-                    flow->event.evidence[i] = '\0';
-                }
-                if (flow->verdict == Verdict::Unknown && (data->flags & FWPS_STREAM_FLAG_SEND_DISCONNECT) != 0) {
-                    flow->verdict = Verdict::Allow;
-                }
-            }
+            InspectProtocol(flow, sending, prefix, copied, data->flags);
             InsertTailList(sending ? &flow->sending : &flow->receiving, &segment->link);
             flow->queued += segment->length;
         }

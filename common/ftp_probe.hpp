@@ -25,6 +25,11 @@ class FtpProbe {
     ProtocolVerdict Verdict() const { return verdict_; }
     const char* Verb() const { return verb_; }
     bool HasGreeting() const { return greeting_; }
+    bool IsUpload() const {
+        return verdict_ == ProtocolVerdict::Ftp &&
+            (TokenEquals("STOR", 4) || TokenEquals("APPE", 4) || TokenEquals("STOU", 4));
+    }
+    bool IsTlsUpgrade() const { return verdict_ == ProtocolVerdict::Ftp && TokenEquals("AUTH", 4); }
 
  private:
     static constexpr size_t kLimit = 512;
@@ -49,7 +54,7 @@ class FtpProbe {
     }
     bool PossibleCommand() const {
         static const char* const commands[] = {
-            "USER", "PASS", "ACCT", "SYST", "FEAT", "PASV", "EPSV", "TYPE", "OPTS", "RETR", "STOR", "APPE",
+            "USER", "PASS", "ACCT", "SYST", "FEAT", "PASV", "EPSV", "TYPE", "OPTS", "RETR", "STOR", "APPE", "STOU",
             "CWD", "CDUP", "PWD", "DELE", "MKD", "RMD", "RNFR", "RNTO", "PORT", "EPRT", "AUTH", "QUIT", "NOOP"
         };
         for (const char* command : commands) {
@@ -83,7 +88,7 @@ class FtpProbe {
         size_t token = 0;
         while (token < sent_ - 2 && client_[token] != ' ') { ++token; }
         static const char* const distinctive[] = {
-            "SYST", "FEAT", "PASV", "EPSV", "TYPE", "OPTS", "RETR", "STOR", "APPE", "CWD", "CDUP", "PWD",
+            "SYST", "FEAT", "PASV", "EPSV", "TYPE", "OPTS", "RETR", "STOR", "APPE", "STOU", "CWD", "CDUP", "PWD",
             "DELE", "MKD", "RMD", "RNFR", "RNTO", "PORT", "EPRT"
         };
         bool ftp = false;
@@ -99,6 +104,37 @@ class FtpProbe {
             for (size_t i = 0; i < copy; ++i) { verb_[i] = static_cast<char>(Upper(static_cast<unsigned char>(client_[i]))); }
             verb_[copy] = '\0';
         }
+    }
+};
+
+// Reuse the command grammar on a confirmed FTP control flow. A later upload
+// needs a fresh file-handle decision; clients may open the source after login.
+class FtpUploadProbe {
+ public:
+    void Reset() { command_.Reset(); disabled_ = false; verb_[0] = '\0'; }
+    bool Feed(const unsigned char* bytes, size_t count) {
+        if (disabled_) { return false; }
+        bool upload = false;
+        for (size_t i = 0; i < count && !disabled_; ++i) {
+            command_.Feed(true, bytes + i, 1);
+            if (bytes[i] != '\n') { continue; }
+            if (command_.IsUpload()) { CopyVerb(); upload = true; }
+            disabled_ = command_.IsTlsUpgrade();
+            command_.Reset();
+        }
+        return upload;
+    }
+    const char* Verb() const { return verb_; }
+
+ private:
+    FtpProbe command_;
+    bool disabled_;
+    char verb_[8];
+    void CopyVerb() {
+        const char* source = command_.Verb();
+        size_t i = 0;
+        while (source[i] != '\0' && i + 1 < sizeof(verb_)) { verb_[i] = source[i]; ++i; }
+        verb_[i] = '\0';
     }
 };
 }  // namespace guard

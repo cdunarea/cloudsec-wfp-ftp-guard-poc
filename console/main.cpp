@@ -20,7 +20,7 @@ class Console {
         SetConsoleOutputCP(CP_UTF8);
         SetConsoleCtrlHandler(Ctrl, TRUE);
         EnableDebugPrivilege();
-        guard::EtwMonitor etw(options.application);
+        guard::EtwMonitor etw(options.application, !options.etw_only);
         if (options.etw && !etw.Start() && options.etw_only) { throw std::runtime_error("ETW network session could not be started (run elevated)"); }
         std::unique_ptr<guard::NetDriverSession> driver;
         if (!options.etw_only) { driver = std::make_unique<guard::NetDriverSession>(options.driver, options.application); }
@@ -34,7 +34,8 @@ class Console {
         }
         if (driver) {
             const auto status = driver->ReadStatus();
-            guard::Diagnostics::Line("[DRIVER SUMMARY] ftp=" + std::to_string(status.detections) + " blocked=" + std::to_string(status.blocked) + " allowed=" + std::to_string(status.allowed));
+            guard::Diagnostics::Line("[DRIVER SUMMARY] ftp_inspections=" + std::to_string(status.detections) +
+                " blocked_flows=" + std::to_string(status.blocked) + " allowed_decisions=" + std::to_string(status.allowed));
             driver.reset();
         }
         etw.Stop();
@@ -105,15 +106,22 @@ class Console {
     }
     static void Handle(guard::NetDriverSession& driver, guard::EtwMonitor& etw, const guard::NetEvent& event) {
         if (event.kind == guard::EventKind::Flow) { guard::Diagnostics::Connection("WFP", event); etw.DriverConnection(event); return; }
-        if (event.kind == guard::EventKind::InspectFtp) { Inspect(driver, event); return; }
+        if (event.kind == guard::EventKind::InspectFtp) { Inspect(driver, etw, event); return; }
         const char* kind = event.kind == guard::EventKind::Blocked ? "BLOCKED" : event.kind == guard::EventKind::Allowed ? "ALLOWED" : "ERROR";
         guard::Diagnostics::Line(std::string("[DRIVER ") + kind + "] flow=" + std::to_string(event.flow) + " pid=" +
             std::to_string(event.process_id) + " detail=" + std::to_string(event.detail));
     }
-    static void Inspect(guard::NetDriverSession& driver, const guard::NetEvent& event) {
+    static void Inspect(guard::NetDriverSession& driver, guard::EtwMonitor& etw, const guard::NetEvent& event) {
         guard::Diagnostics::Line("[FTP CONFIRMED] flow=" + std::to_string(event.flow) + " pid=" + std::to_string(event.process_id) +
             " port=" + std::to_string(event.remote_port) + " control-command=" + std::string(event.evidence));
-        const auto result = guard::FileScanner().Scan(static_cast<DWORD>(event.process_id), event.process_created);
+        const std::string command(event.evidence);
+        const bool upload = command == "STOR" || command == "APPE" || command == "STOU";
+        const auto recent = upload ? etw.RecentFiles(event) : guard::NetFileEvidence{};
+        auto result = guard::FileScanner().Scan(static_cast<DWORD>(event.process_id), event.process_created, 8000, recent.paths);
+        if (!recent.complete && result.verdict == guard::ScanVerdict::Clear) {
+            result.verdict = guard::ScanVerdict::Incomplete;
+            result.detail = recent.detail;
+        }
         const char* rule = result.verdict == guard::ScanVerdict::SecretName ? "secret-filename" :
                            result.verdict == guard::ScanVerdict::SecretContent ? "secret-content" :
                            result.verdict == guard::ScanVerdict::Incomplete ? "inspection-incomplete" : "no-secret-open-file";
@@ -121,7 +129,8 @@ class Console {
         guard::Diagnostics::Line(std::string(result.Block() ? "[BLOCK]" : "[ALLOW]") + " flow=" + std::to_string(event.flow) +
             " pid=" + std::to_string(event.process_id) + " rule=" + rule + " file=\"" + guard::Diagnostics::Utf8(result.path) +
             "\" open_file_handles=" + std::to_string(result.handles) + " scanned_files=" + std::to_string(result.files) +
-            " scanned_bytes=" + std::to_string(result.bytes) + " detail=" + result.detail +
+            " scanned_bytes=" + std::to_string(result.bytes) + " recent_files=" + std::to_string(result.recent_files) +
+            " file_evidence=" + (result.recent_match ? "recent-file-open" : "open-handle") + " detail=" + result.detail +
             (accepted ? " decision=accepted" : " decision=stale-or-failed error=" + std::to_string(GetLastError())));
     }
 };

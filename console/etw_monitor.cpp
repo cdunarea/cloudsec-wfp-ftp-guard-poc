@@ -11,8 +11,10 @@ namespace guard {
 const GUID EtwMonitor::kTcpIp = {0x9a280ac0,0xc8e0,0x11d1,{0x84,0xe2,0x00,0xc0,0x4f,0xb9,0x98,0xa2}};
 const GUID EtwMonitor::kKernelNetwork = {0x7dd42a49,0x5329,0x4832,{0x8d,0xfd,0x43,0xd9,0x79,0x15,0x3a,0x88}};
 const GUID EtwMonitor::kWinInet = {0x43d1a55c,0x76d6,0x4f7e,{0x99,0x5c,0x64,0xc7,0x11,0xe5,0xca,0xfe}};
+const GUID EtwMonitor::kFileIo = {0x90cbdc39,0x4a3e,0x11d1,{0x84,0xf4,0x00,0x00,0xf8,0x04,0x64,0xe3}};
 
-EtwMonitor::EtwMonitor(std::wstring application) : application_(std::move(application)) {}
+EtwMonitor::EtwMonitor(std::wstring application, bool file_history)
+    : application_(std::move(application)), file_history_(file_history) {}
 EtwMonitor::~EtwMonitor() { Stop(); }
 
 void EtwMonitor::EnableProfilePrivilege() {
@@ -28,6 +30,7 @@ void EtwMonitor::EnableProfilePrivilege() {
 }
 
 bool EtwMonitor::StartSession(Session& session, bool kernel) {
+    session.owner = this;
     session.name = L"WfpFtpGuard-" + std::to_wstring(GetCurrentProcessId()) + (kernel ? L"-Net-" : L"-WinInet-") + std::to_wstring(GetTickCount64());
     session.properties.resize(sizeof(EVENT_TRACE_PROPERTIES) + (session.name.size() + 1) * sizeof(wchar_t));
     auto* properties = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(session.properties.data());
@@ -41,6 +44,9 @@ bool EtwMonitor::StartSession(Session& session, bool kernel) {
     properties->FlushTimer = 1;
     properties->LogFileMode = EVENT_TRACE_REAL_TIME_MODE | (kernel ? EVENT_TRACE_SYSTEM_LOGGER_MODE : 0);
     properties->EnableFlags = kernel ? EVENT_TRACE_FLAG_NETWORK_TCPIP : 0;
+    if (kernel && file_history_) {
+        properties->EnableFlags |= EVENT_TRACE_FLAG_DISK_FILE_IO | EVENT_TRACE_FLAG_FILE_IO | EVENT_TRACE_FLAG_FILE_IO_INIT;
+    }
     properties->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
     const ULONG error = StartTraceW(&session.controller, session.name.c_str(), properties);
     if (error != ERROR_SUCCESS) { Diagnostics::Line("[ETW] StartTrace failed: error=" + std::to_string(error)); session.controller = 0; return false; }
@@ -53,11 +59,13 @@ bool EtwMonitor::StartSession(Session& session, bool kernel) {
     logfile.LoggerName = session.name.data();
     logfile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
     logfile.EventRecordCallback = Callback;
-    logfile.Context = this;
+    logfile.BufferCallback = BufferCallback;
+    logfile.Context = &session;
     session.consumer = OpenTraceW(&logfile);
     if (session.consumer == INVALID_PROCESSTRACE_HANDLE) { Diagnostics::Line("[ETW] OpenTrace failed: error=" + std::to_string(GetLastError())); return false; }
     session.thread = std::thread([&session] {
         const auto error_code = ProcessTrace(&session.consumer, 1, nullptr, nullptr);
+        session.progress.Finish();
         if (error_code != ERROR_SUCCESS && error_code != ERROR_CANCELLED) { Diagnostics::Line("[ETW] ProcessTrace ended: error=" + std::to_string(error_code)); }
     });
     return true;
@@ -67,12 +75,14 @@ bool EtwMonitor::Start() {
     EnableProfilePrivilege();
     const bool network = StartSession(sessions_[0], true);
     const bool wininet = StartSession(sessions_[1], false);
-    Diagnostics::Line(std::string("[ETW] TCP/IP=") + (network ? "on" : "unavailable") + ", WinINet=" + (wininet ? "on" : "unavailable"));
+    Diagnostics::Line(std::string("[ETW] TCP/IP=") + (network ? "on" : "unavailable") + ", WinINet=" + (wininet ? "on" : "unavailable") +
+        ", file-open history=" + (network && file_history_ ? "on" : "off"));
     return network;
 }
 
 void EtwMonitor::Stop() {
     for (auto& session : sessions_) {
+        session.progress.Finish();
         if (session.controller != 0) {
             auto* properties = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(session.properties.data());
             const ULONG status = ControlTraceW(session.controller, session.name.c_str(), properties, EVENT_TRACE_CONTROL_STOP);
@@ -112,15 +122,70 @@ std::string EtwMonitor::Ansi(EVENT_RECORD* record, const wchar_t* name) {
     const auto end = std::find(bytes.begin(), bytes.end(), 0);
     return std::string(bytes.begin(), end);
 }
+std::wstring EtwMonitor::Wide(EVENT_RECORD* record, const wchar_t* name) {
+    const auto bytes = Property(record, name);
+    if (bytes.empty() || bytes.size() % sizeof(wchar_t) != 0) { return {}; }
+    std::wstring value(bytes.size() / sizeof(wchar_t), L'\0');
+    memcpy_s(value.data(), bytes.size(), bytes.data(), bytes.size());
+    const auto end = value.find(L'\0');
+    if (end != std::wstring::npos) { value.resize(end); }
+    return value;
+}
+void EtwMonitor::FileRecord(EVENT_RECORD* record) {
+    if (record->EventHeader.EventDescriptor.Opcode != 64) { return; }
+    const auto pid = record->EventHeader.ProcessId;
+    {
+        std::lock_guard lock(mutex_);
+        if (std::find(file_processes_.begin(), file_processes_.end(), pid) == file_processes_.end()) { return; }
+    }
+    const auto path = Wide(record, L"OpenPath");
+    if (path.empty() || path.back() == L'\\' || (Number(record, L"CreateOptions") & 1U) != 0) { return; }
+    const auto at = record->EventHeader.TimeStamp.QuadPart;
+    if (at <= 0) { return; }
+    std::lock_guard lock(mutex_);
+    file_activity_.Record(pid, static_cast<UINT64>(at), path);
+    ++file_opens_;
+}
+UINT64 EtwMonitor::FileTimeNow() {
+    FILETIME time{};
+    GetSystemTimePreciseAsFileTime(&time);
+    return (static_cast<UINT64>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+}
+NetFileEvidence EtwMonitor::RecentFiles(const NetEvent& event) {
+    if (!file_history_ || sessions_[0].controller == 0) { return {}; }
+    auto& session = sessions_[0];
+    auto storage = session.properties;
+    auto* properties = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(storage.data());
+    properties->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+    properties->LogFileNameOffset = 0;
+    const auto started = GetTickCount64();
+    const ULONG status = ControlTraceW(session.controller, session.name.c_str(), properties, EVENT_TRACE_CONTROL_FLUSH);
+    if (status != ERROR_SUCCESS) { return {{}, false, "ETW flush: error=" + std::to_string(status)}; }
+    if (properties->EventsLost != 0 || properties->RealTimeBuffersLost != 0) { return {{}, false, "ETW file evidence lost"}; }
+    // BufferCallback runs after every event in a delivered buffer. Wait for the
+    // flushed buffer count, rather than guessing when the timer has delivered it.
+    const bool delivered = session.progress.Wait(properties->BuffersWritten, std::chrono::milliseconds(2000));
+    Diagnostics::Line("[ETW SYNC] flushed_buffers=" + std::to_string(properties->BuffersWritten) +
+        " delivered_buffers=" + std::to_string(session.progress.Buffers()) + " elapsed_ms=" + std::to_string(GetTickCount64() - started));
+    if (!delivered) { return {{}, false, "ETW file evidence delivery timed out or consumer stopped"}; }
+    std::lock_guard lock(mutex_);
+    return {file_activity_.Paths(event.process_id, event.captured_at, FileTimeNow()), true, {}};
+}
 
 void WINAPI EtwMonitor::Callback(EVENT_RECORD* record) {
-    auto* monitor = static_cast<EtwMonitor*>(record->UserContext);
-    if (monitor == nullptr) { return; }
-    try { monitor->Record(record); }
+    auto* session = static_cast<Session*>(record->UserContext);
+    if (session == nullptr || session->owner == nullptr) { return; }
+    try { session->owner->Record(record); }
     catch (const std::exception& error) { Diagnostics::Line(std::string("[ETW] decode error: ") + error.what()); }
+}
+ULONG WINAPI EtwMonitor::BufferCallback(EVENT_TRACE_LOGFILEW* logfile) {
+    auto* session = static_cast<Session*>(logfile->Context);
+    if (session != nullptr) { session->progress.Advance(logfile->BuffersRead); }
+    return TRUE;
 }
 
 void EtwMonitor::Record(EVENT_RECORD* record) {
+    if (IsEqualGUID(record->EventHeader.ProviderId, kFileIo)) { FileRecord(record); return; }
     if (IsEqualGUID(record->EventHeader.ProviderId, kWinInet)) {
         ++wininet_events_;
         if (record->EventHeader.EventDescriptor.Id == 103) { ++wininet_connections_; }
@@ -185,10 +250,18 @@ void EtwMonitor::Observe(const NetEvent& event, bool driver) {
     if (matched != 0) { Diagnostics::Line("[CORRELATED] ETW/TCPIP <-> WFP flow=" + std::to_string(matched) + " pid=" + std::to_string(event.process_id) + " (PID + full connection tuple)"); }
 }
 
-void EtwMonitor::DriverConnection(const NetEvent& event) { Observe(event, true); }
+void EtwMonitor::DriverConnection(const NetEvent& event) {
+    {
+        std::lock_guard lock(mutex_);
+        if (file_processes_.size() >= 1024) { file_processes_.pop_front(); }
+        file_processes_.push_back(event.process_id);
+    }
+    Observe(event, true);
+}
 std::string EtwMonitor::Summary() const {
     return "[ETW SUMMARY] tcp_connections=" + std::to_string(connections_.load()) + " wininet_ftp=" +
            std::to_string(wininet_ftp_.load()) + " correlated=" + std::to_string(correlations_.load()) +
-           " wininet_events=" + std::to_string(wininet_events_.load()) + " wininet_connections=" + std::to_string(wininet_connections_.load());
+           " wininet_events=" + std::to_string(wininet_events_.load()) + " wininet_connections=" + std::to_string(wininet_connections_.load()) +
+           " file_opens=" + std::to_string(file_opens_.load());
 }
 }  // namespace guard

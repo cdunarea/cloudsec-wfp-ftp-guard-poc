@@ -5,15 +5,22 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 #include "file_scanner.hpp"
 #include "ftp_probe.hpp"
+#include "file_activity.hpp"
+#include "trace_progress.hpp"
+#include <future>
 #include "secret_matcher.hpp"
 
 class Tests {
  public:
     static int Run() {
         Parser();
+        UploadCommands();
+        FileActivity();
+        TraceProgress();
         Matchers();
         Files();
         std::cout << "Assertions=" << checks_ << " failures=" << failures_ << '\n';
@@ -34,7 +41,7 @@ class Tests {
         const std::string greeting = "220 Welcome to the file server\r\n";
         const std::vector<std::string> valid{
             "USER anonymous\r\n", "PASS password\r\n", "ACCT account\r\n", "QUIT\r\n", "NOOP\r\n", "SYST\r\n", "FEAT\r\n",
-            "PASV\r\n", "EPSV\r\n", "TYPE I\r\n", "OPTS UTF8 ON\r\n", "RETR a.txt\r\n", "STOR a.txt\r\n", "APPE a.txt\r\n",
+            "PASV\r\n", "EPSV\r\n", "TYPE I\r\n", "OPTS UTF8 ON\r\n", "RETR a.txt\r\n", "STOR a.txt\r\n", "APPE a.txt\r\n", "STOU\r\n",
             "CWD /\r\n", "CDUP\r\n", "PWD\r\n", "DELE a.txt\r\n", "MKD dir\r\n", "RMD dir\r\n", "RNFR old\r\n", "RNTO new\r\n",
             "PORT 127,0,0,1,1,2\r\n", "EPRT |1|127.0.0.1|4242|\r\n", "AUTH TLS\r\n", "USER Jos\xC3\xA9\r\n"};
         for (auto line : valid) {
@@ -75,6 +82,74 @@ class Tests {
         Check(Feed(probe, true, "USER a\r\n") == ProtocolVerdict::Ftp, "multiline FTP greeting");
         probe.Reset(); Feed(probe, false, greeting);
         Check(Feed(probe, true, "TYPE " + std::string(600,'I')) == ProtocolVerdict::Other, "oversized client header bounded");
+    }
+    static bool FeedUpload(guard::FtpUploadProbe& probe, const std::string& value) {
+        return probe.Feed(reinterpret_cast<const unsigned char*>(value.data()), value.size());
+    }
+    static void UploadCommands() {
+        const std::vector<std::pair<std::string, std::string>> uploads{
+            {"STOR a.txt\r\n", "STOR"}, {"appe a.txt\r\n", "APPE"}, {"STOU\r\n", "STOU"}, {"stou unique.txt\r\n", "STOU"}};
+        for (const auto& [command, verb] : uploads) {
+            for (size_t cut = 0; cut < command.size(); ++cut) {
+                guard::FtpUploadProbe probe; probe.Reset();
+                Check(!FeedUpload(probe, "OPTS UTF8 ON\r\nUSER test\r\nTYPE I\r\n"), "login and mode commands do not request an upload scan");
+                Check(!FeedUpload(probe, command.substr(0, cut)), "incomplete upload command is held until the line is complete");
+                Check(FeedUpload(probe, command.substr(cut)), "upload command detected across every split after login");
+                Check(std::string(probe.Verb()) == verb, "upload evidence contains only the normalized verb");
+                Check(!FeedUpload(probe, "NOOP\r\n"), "non-upload command does not reuse a previous decision request");
+                Check(FeedUpload(probe, "STOR next.txt\r\n"), "later upload in the same session requests another scan");
+            }
+        }
+        guard::FtpUploadProbe probe; probe.Reset();
+        Check(!probe.Feed(nullptr, 0), "empty upload input is safe");
+        Check(!FeedUpload(probe, "XYZ STOR hidden.txt\r\nSTORAGE x\r\nSTOR x\n"), "embedded verbs and malformed lines are not upload commands");
+        Check(FeedUpload(probe, std::string(600,'X') + "\r\nSTOR next.txt\r\n"), "upload detection recovers after an oversized line");
+        Check(FeedUpload(probe, "STOR a\r\nAPPE b\r\n") && std::string(probe.Verb()) == "APPE", "multiple complete commands in one indication preserve upload evidence");
+        Check(!FeedUpload(probe, "ST"), "partial command has no decision");
+        probe.Reset();
+        Check(std::string(probe.Verb()).empty() && !FeedUpload(probe, "OR x\r\n"), "reset discards partial command and old evidence");
+        Check(!FeedUpload(probe, "AUTH TLS\r\nSTOR hidden.txt\r\n"), "TLS upgrade stops plaintext upload parsing within the same indication");
+        Check(!FeedUpload(probe, "STOR encrypted.txt\r\n"), "TLS upgrade remains outside plaintext inspection");
+        probe.Reset();
+        Check(FeedUpload(probe, "STOR clear.txt\r\n"), "new connection re-enables upload inspection");
+    }
+    static void FileActivity() {
+        constexpr std::uint64_t now = 134000000000000000ULL;
+        guard::NetFileActivityCache cache;
+        cache.Record(0, now, L"ignored.txt");
+        cache.Record(7, 0, L"ignored.txt");
+        cache.Record(7, now, L"");
+        Check(cache.Paths(7, now - 10, now).empty(), "invalid file-open records are ignored");
+        cache.Record(7, now - 20, L"closed-before-connect.txt");
+        cache.Record(7, now - 5, L"current.txt");
+        cache.Record(7, now - 4, L"current.txt");
+        cache.Record(8, now - 3, L"other-process.txt");
+        cache.Record(7, now + 1, L"future.txt");
+        const auto paths = cache.Paths(7, now - 10, now);
+        Check(paths.size() == 1 && paths[0] == L"current.txt", "file evidence is PID-scoped, after connection time, deduplicated and not from the future");
+        Check(cache.Paths(7, now - 20, now).size() == 2, "connection-time boundary is inclusive");
+        Check(cache.Paths(7, 1, now + 31ULL * 10000000).empty(), "old file evidence expires");
+        for (std::uint64_t i = 0; i < 1100; ++i) { cache.Record(7, now + i, std::to_wstring(i)); }
+        const auto bounded = cache.Paths(7, now, now + 1100);
+        Check(bounded.size() == 1024 && bounded.front() == L"76" && bounded.back() == L"1099", "file evidence cache evicts oldest records at its capacity");
+    }
+    static void TraceProgress() {
+        using namespace std::chrono_literals;
+        guard::NetTraceProgress progress;
+        Check(progress.Wait(0, 0ms), "an already delivered trace needs no wait");
+        Check(!progress.Wait(1, 0ms), "missing trace delivery times out");
+        progress.Advance(3);
+        progress.Advance(2);
+        Check(progress.Buffers() == 3 && progress.Wait(3, 0ms), "trace progress is monotonic and notification before wait is retained");
+        auto delivered = std::async(std::launch::async, [&] { return progress.Wait(5, 5s); });
+        progress.Advance(4);
+        Check(!progress.Wait(5, 0ms), "a partial flush cannot release an upload");
+        progress.Advance(5);
+        Check(delivered.wait_for(1s) == std::future_status::ready && delivered.get(), "complete flush wakes the waiting consumer without a fixed delay");
+        auto stopped = std::async(std::launch::async, [&] { return progress.Wait(6, 5s); });
+        progress.Finish();
+        Check(stopped.wait_for(1s) == std::future_status::ready && !stopped.get(), "consumer shutdown interrupts a trace wait");
+        Check(!progress.Wait(0, 0ms), "a stopped consumer cannot certify file evidence");
     }
     static bool Contains(const std::string& value) {
         const std::vector<std::string> patterns{std::string("secret",6),std::string("s\0e\0c\0r\0e\0t\0",12),std::string("\0s\0e\0c\0r\0e\0t",12)};
@@ -172,6 +247,31 @@ class Tests {
         Check(scanner.InspectFile(INVALID_HANDLE_VALUE).verdict == guard::ScanVerdict::Incomplete, "invalid handle fails closed");
         Check(scanner.Scan(GetCurrentProcessId(), 1).verdict == guard::ScanVerdict::Incomplete, "PID reuse guard");
         Check(scanner.Scan(MAXDWORD, 1).verdict == guard::ScanVerdict::Incomplete, "missing process fails closed");
+        const auto closed_name = scanner.Scan(GetCurrentProcessId(), process_created, 8000, {(root / L"mY-SeCrEt-name.txt").wstring()});
+        Check(closed_name.verdict == guard::ScanVerdict::SecretName && closed_name.recent_match && closed_name.recent_files == 1,
+              "recently opened source is checked after its file handle closes");
+        const auto closed_content = scanner.Scan(GetCurrentProcessId(), process_created, 8000, {(root / L"public-2.bin").wstring()});
+        Check(closed_content.verdict == guard::ScanVerdict::SecretContent && closed_content.recent_match,
+              "recent source content is checked independently of live handles");
+        Check(scanner.Scan(GetCurrentProcessId(), process_created, 8000, {(root / L"public-0.bin").wstring()}).verdict == guard::ScanVerdict::Clear,
+              "recent public source remains allowed");
+        Check(scanner.Scan(GetCurrentProcessId(), process_created, 8000, {(root / L"missing.bin").wstring()}).verdict == guard::ScanVerdict::Incomplete,
+              "unavailable recent source fails closed");
+        Check(scanner.Scan(GetCurrentProcessId(), process_created, 8000, {L"\\Device\\NamedPipe\\ignored"}).verdict == guard::ScanVerdict::Clear,
+              "non-disk file telemetry is ignored");
+        Check(scanner.Scan(GetCurrentProcessId(), process_created, 0, {(root / L"public-0.bin").wstring()}).verdict == guard::ScanVerdict::Incomplete,
+              "recent-file processing respects its scan deadline");
+        {
+            const auto path = root / L"public-2.bin";
+            guard::WinHandle file(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr));
+            std::vector<wchar_t> native(32768);
+            const DWORD length = GetFinalPathNameByHandleW(file.Get(), native.data(), static_cast<DWORD>(native.size()), VOLUME_NAME_NT);
+            if (length == 0 || length >= native.size()) { throw std::runtime_error("unit native file path"); }
+            const std::wstring native_path(native.data(), length);
+            file.Reset();
+            const auto result = scanner.Scan(GetCurrentProcessId(), process_created, 8000, {native_path});
+            Check(result.verdict == guard::ScanVerdict::SecretContent && result.recent_match, "native ETW disk path is opened through GLOBALROOT");
+        }
         guard::WinHandle directory(CreateFileW(root.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                                nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
         Check(directory.Valid() && scanner.InspectFile(directory.Get()).files == 0, "directory handles are not files");
