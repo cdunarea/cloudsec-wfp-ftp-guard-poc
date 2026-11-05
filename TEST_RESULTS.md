@@ -1,7 +1,127 @@
 # Test results and reproduction
 
-Latest validation: **native Windows Explorer FTP and FTP/FTPS regressions on W11Test, 2026-11-05 UTC**.
+Latest validation: **FileZilla and WinSCP live FTP/explicit-FTPS testing on W11Test, 2026-11-05 UTC: 72/72 main cases and 8/8 console replays**.
 Source: C:\dev\sbg-poc\cloudsec-wfp-ftp-guard-poc on DEV-11x64.
+
+**Artifact retention (2026-11-05):** The latest real-client evidence is in
+C:\dev\tests\FTP-Clients-20261105T065950Z on W11Test, with its ZIP archive.
+The earlier Explorer evidence remains in
+C:\dev\tests\Explorer-FTP-20261105T051017Z on W11Test. The unique earlier 1 GiB
+and Schannel evidence is retained only as
+C:\dev\tests\ftp-large-fix-20261105T022830Z.zip, with its checksum metadata.
+Superseded test folders and older DEV output builds were removed. Earlier paths
+listed in historical sections below are records of past runs, not retained folders.
+The latest tested build remains in out\explorer-ftp-20261105T051017Z.
+
+## FileZilla and WinSCP: live FTP and explicit FTPS against SFTPGo
+
+**All 72 main cases passed on W11Test on 2026-11-05 UTC.** This includes
+8 transfers with the driver absent and 64 with the sender protected by WFP.
+The protected sender was the client for uploads and sftpgo.exe for server pulls.
+All live traffic and driver loading stayed on W11Test. Transfers used loopback
+to simulate the remote peer. DEV-11x64 was not used as a transfer endpoint.
+
+### Clients, methods and tested build
+
+| Item | Verified configuration |
+| --- | --- |
+| FileZilla | 3.71.1, x64, valid Tim Kosse signature; transfers launched through its GUI |
+| WinSCP | 6.7.0.17845, x86, valid Martin Prikryl signature; its official .NET assembly drove the installed WinSCP.exe |
+| Server | Existing SFTPGo 2.7.6 service on W11Test |
+| Address family | IPv4 loopback; IPv6 transfers were not part of this run |
+| FTP control ports | 21 and nonstandard port 49237 |
+| Data modes | Passive for both clients; additional active plain-FTP cases in WinSCP |
+| FTPS | Explicit TLS upgrade, with encrypted control and data; lab certificate fingerprint checked |
+| Retry policy | Automatic retries disabled to obtain a bounded result for a denied transfer |
+| Transfer isolation | Fresh client process, FTP connections and guard session for each main case |
+| Build | Existing Release build in out\explorer-ftp-20261105T051017Z; no PoC source change was required by these tests |
+| ftp-guard.exe SHA-256 | 3D5928720DE8871C858F4BCCEECF290F32E4E317B3B2614C63B20D066A8C382C |
+| WfpFtpGuard.sys SHA-256 | 30286BAEEB94109D798163426FA4420CD24B3351AB0140407EA17AD3F4C7EF9B |
+
+The WFP connection diagnostics identified the installed client executable and
+its actual transfer PID. The WinSCP process was WinSCP.exe. The FileZilla
+process was filezilla.exe. For protected server pulls, the intercepted sender
+was the existing sftpgo.exe service process.
+
+### Main matrix
+
+| Group | WinSCP | FileZilla |
+| --- | ---: | ---: |
+| Driver absent: FTP and explicit FTPS, upload and download, public 1 MiB | 4 / 4 | 4 / 4 |
+| Driver enabled: both sender roles and both protocols; public, secret filename and EOF content; 1 MiB and 100 MiB | 24 / 24 | 24 / 24 |
+| Driver enabled: both sender roles; public and EOF content; 1 GiB | 8 / 8, FTP and FTPS | 4 / 4, FTP |
+| Additional active FTP on port 49237; both sender roles; public and EOF content, 1 MiB | 4 / 4 | Not included |
+| Total | **40 / 40** | **32 / 32** |
+
+All public transfers completed and matched the full source SHA-256 and length.
+Every protected public transfer also required an accepted source-read allow
+decision. Each sensitive case required the accepted filename or content rule
+to name the intended source. A generic inspection-incomplete block did not
+count as a successful sensitive-file detection.
+
+The sensitive content was mixed-case ASCII SeCrEt in the final six bytes of a
+file whose filename did not contain that word. Marker offsets were 1,048,570,
+104,857,594 and 1,073,741,818 bytes for the 1 MiB, 100 MiB and 1 GiB sources.
+The source scanner therefore had to reach EOF for these content decisions.
+Every denied FileZilla case also required its own failed-transfer status.
+WinSCP reported transfer errors through its official API.
+
+### What the receiver checks establish
+
+All 40 sensitive cases had **zero receiver file bytes** after the failed
+transfer. There were **31 existing empty files and 9 absent files**. The per-case
+JSON distinguishes these outcomes. Blocking does not prevent creation of an
+empty destination entry.
+
+SFTPGo's logs independently recorded zero received bytes for all 20 blocked
+client uploads. Server timestamps were interpreted as UTC; their log format
+omits the timezone suffix.
+
+These assertions do not prove that no destination entry was ever created and
+removed. They also do not constitute an independent packet capture proving
+zero payload delivery. FTP setup, commands and replies can precede a file-data
+block. Server send counters may include bytes queued by Windows before the
+WFP verdict; they must not be equated with bytes delivered to the client.
+
+### Large-file timing and scope
+
+| Allowed 1 GiB transfer | WinSCP | FileZilla |
+| --- | ---: | ---: |
+| Plain FTP upload, protected client | 7.3 s | 7.2 s |
+| Plain FTP download, protected server | 8.1 s | 4.9 s |
+| Explicit FTPS upload, protected client | 93.6 s | Not included at 1 GiB |
+| Explicit FTPS download, protected server | 34.2 s | Not included at 1 GiB |
+
+These are single-run timings on this VM. The clients used different automation
+paths and timer boundaries, so the figures are not a client benchmark. FileZilla
+explicit FTPS was covered through 100 MiB, including content at EOF.
+
+FTPS enforcement still depends on observable local file-read evidence and source
+inspection. WFP does not expose decrypted TLS data. These successful file-based
+cases do not establish reliable handling of all memory-backed, cached or mapped
+sources. Fresh single-transfer sessions also do not establish arbitrary parallel
+transfer attribution or reuse of encrypted control connections for multiple files.
+The separate built-in curl/Schannel limitation described below remains unchanged.
+
+### Evidence and console screenshots
+
+Sanitized evidence is retained on W11Test in
+C:\dev\tests\FTP-Clients-20261105T065950Z and its ZIP archive. It contains
+the per-case receiver measurements, SHA-256 values, native guard diagnostics,
+FileZilla status text, fixture metadata and binary provenance. Account secrets
+and transient support-script names are excluded.
+
+Eight additional 100 MiB transfers replay the successful checks for genuine
+console screenshots. Each client has a plain-FTP upload allow, a plain-FTP
+upload content block, an explicit-FTPS upload content block, and an explicit-FTPS
+protected-server pull content block. These are separate live replays, not log
+text rendered into an image. Screenshot filenames start with proof-winscp or
+proof-filezilla. Each has matching JSON and console text.
+
+The driver and its ETW sessions are stopped after testing. Test payloads,
+temporary tasks and support files are removed. SFTPGo, the installed clients,
+the existing account file and Explorer's saved login are preserved.
+
 
 ## Windows Explorer: live FTP against SFTPGo
 
@@ -336,7 +456,7 @@ Live transfer and intentional-unload checks validate the kernel paths exercised.
 ### Evidence, cleanup and remaining scope
 
 Sanitized results, transcripts, screenshots and aggregate records are retained
-on W11Test under **C:\dev\tests\ftp-large-fix-20261105T022830Z**.
+on W11Test as **C:\dev\tests\ftp-large-fix-20261105T022830Z.zip** (archive only).
 Final-build results are in the Final folder. Earlier candidates and failures are
 kept separately, with their own hashes. They are not merged into final pass counts.
 Credentials and unrelated implementation-script names are excluded.
