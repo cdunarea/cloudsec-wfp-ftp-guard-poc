@@ -48,6 +48,7 @@ class EtwMonitor {
     std::mutex mutex_;
     std::deque<Observation> observations_;
     std::deque<UINT64> file_processes_;
+    NetFileOpenCache file_open_attempts_;
     NetFileActivityCache file_activity_;
     NetFileReadCache file_reads_;
     std::atomic<UINT64> file_opens_{0};
@@ -74,6 +75,7 @@ class EtwMonitor {
     static std::string Ansi(EVENT_RECORD* record, const wchar_t* name);
     static std::wstring Wide(EVENT_RECORD* record, const wchar_t* name);
     void FileRecord(EVENT_RECORD* record);
+    void FinishFileOpen(EVENT_RECORD* record);
     static UINT64 FileTimeNow();
     static void EnableProfilePrivilege();
 };

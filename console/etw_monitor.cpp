@@ -140,6 +140,7 @@ std::wstring EtwMonitor::Wide(EVENT_RECORD* record, const wchar_t* name) {
 }
 void EtwMonitor::FileRecord(EVENT_RECORD* record) {
     const auto opcode = record->EventHeader.EventDescriptor.Opcode;
+    if (opcode == 76) { FinishFileOpen(record); return; }
     if (opcode != 64 && opcode != 66 && opcode != 67) { return; }
     const auto pid = record->EventHeader.ProcessId;
     if (pid == GetCurrentProcessId()) { return; } // Scanning must not create its own evidence/decoder backlog.
@@ -162,8 +163,23 @@ void EtwMonitor::FileRecord(EVENT_RECORD* record) {
     const auto path = Wide(record, L"OpenPath");
     if (path.empty() || path.back() == L'\\' || (Number(record, L"CreateOptions") & 1U) != 0) { return; }
     std::lock_guard lock(mutex_);
-    file_activity_.Record(pid, static_cast<UINT64>(at), path);
-    file_reads_.Open(pid, object, static_cast<UINT64>(at), path);
+    file_open_attempts_.Begin(pid, PointerNumber(record, L"IrpPtr"), object, static_cast<UINT64>(at), path);
+}
+void EtwMonitor::FinishFileOpen(EVENT_RECORD* record) {
+    std::lock_guard lock(mutex_);
+    if (file_open_attempts_.Empty()) { return; }
+    const auto status = Property(record, L"NtStatus");
+    // A missing status is never a successful open. The ETW lost-event checks
+    // and a later missing-source verdict remain conservative.
+    std::optional<std::uint32_t> result;
+    if (status.size() == sizeof(std::uint32_t)) {
+        result.emplace();
+        memcpy_s(&*result, sizeof(*result), status.data(), status.size());
+    }
+    const auto opened = file_open_attempts_.Finish(PointerNumber(record, L"IrpPtr"), result);
+    if (!opened) { return; }
+    file_activity_.Record(opened->pid, opened->at, opened->path);
+    file_reads_.Open(opened->pid, opened->object, opened->at, opened->path);
     ++file_opens_;
 }
 UINT64 EtwMonitor::FileTimeNow() {
@@ -204,11 +220,13 @@ NetFileEvidence EtwMonitor::RecentFiles(const NetEvent& event) {
     std::lock_guard lock(mutex_);
     const auto since = event.file_since != 0 ? event.file_since : event.captured_at;
     const bool data = (event.flags & NetData) != 0;
-    if ((data ? file_reads_.Evictions() : file_activity_.Evictions()) != 0) {
+    const auto now = FileTimeNow();
+    if (!file_open_attempts_.Reliable()) { return {{}, false, "bounded file-open completion correlation lost"}; }
+    if (!(data ? file_reads_.Complete(event.process_id, since, now) : file_activity_.Complete(event.process_id, since, now))) {
         return {{}, false, "bounded file evidence cache evicted records"};
     }
-    return {data ? file_reads_.Paths(event.process_id, since, FileTimeNow()) :
-                   file_activity_.Paths(event.process_id, since, FileTimeNow()), true, {}};
+    return {data ? file_reads_.Paths(event.process_id, since, now) :
+                   file_activity_.Paths(event.process_id, since, now), true, {}};
 }
 
 void WINAPI EtwMonitor::Callback(EVENT_RECORD* record) {

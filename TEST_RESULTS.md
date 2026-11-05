@@ -623,10 +623,6 @@ account file, and sanitized results remain.
 
 ## Historical evidence
 
-[HISTORICAL_TEST_RESULTS.md](HISTORICAL_TEST_RESULTS.md) preserves the previous CAL
-real-server results and the older synthetic handshake matrix. They apply to
-earlier revisions and are not validation of the current implementation.
-
 The following earlier explanation is retained verbatim. It describes the
 2026-11-03 CAL build. In the current implementation, initial FTP recognition is
 diagnostic; later command/data gates trigger source-path inspection.

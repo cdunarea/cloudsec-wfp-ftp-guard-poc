@@ -185,7 +185,12 @@ void FileScanner::InspectRecent(const std::wstring& path, ULONGLONG deadline, Sc
     if (GetTickCount64() >= deadline) { Incomplete(result, "Recent-file scan deadline", ERROR_TIMEOUT); return; }
     WinHandle file(CreateFileW(open.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
-    if (!file.Valid()) { Incomplete(result, "Open recent file", GetLastError()); return; }
+    if (!file.Valid()) {
+        const auto error = GetLastError();
+        if (result.verdict == ScanVerdict::Clear) { result.path = path; }
+        Incomplete(result, "Open recent file", error);
+        return;
+    }
     ++result.recent_files;
     // The temporary sharing lease excludes writers/replacement while checking a
     // cached file identity/change stamp. Incompatible sources use a full scan.

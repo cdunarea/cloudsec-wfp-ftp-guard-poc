@@ -137,6 +137,16 @@ class Console {
             ((event.flags & guard::NetData) != 0 ? " association=process-and-peer" : " association=control-command") +
             ((event.flags & guard::NetAmbiguous) != 0 ? " ambiguous=yes" : "") +
             ((event.flags & guard::NetExplicitTls) != 0 ? " control-upgrade=requested data-protection=unavailable decrypted=no" : ""));
+        if ((event.flags & guard::NetData) == 0) {
+            // Opening an optional shell resource is not proof it is an upload
+            // source. Release the qualified command; the separate data flow
+            // remains held until actual source-read evidence is inspected.
+            const bool accepted = driver.Decide(event.flow, false);
+            guard::Diagnostics::Line("[ALLOW] flow=" + std::to_string(event.flow) + " pid=" + std::to_string(event.process_id) +
+                " rule=ftp-control-qualified file-inspection=pending-data-read verdict_scope=command" +
+                (accepted ? " decision=accepted" : " decision=stale-or-failed error=" + std::to_string(GetLastError())));
+            return;
+        }
         const auto recent = etw.RecentFiles(event);
         auto result = scanner_.Scan(static_cast<DWORD>(event.process_id), event.process_created, 8000, recent.paths, true,
             (event.flags & guard::NetData) != 0 ? event.flow : 0);

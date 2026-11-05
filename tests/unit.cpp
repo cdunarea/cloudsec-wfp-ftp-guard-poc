@@ -182,6 +182,30 @@ class Tests {
     }
     static void FileActivity() {
         constexpr std::uint64_t now = 134000000000000000ULL;
+        guard::NetFileOpenCache opens;
+        opens.Begin(0, 1, 2, now, L"invalid"); opens.Begin(7, 1, 0, now, L"invalid");
+        opens.Begin(7, 1, 2, 0, L"invalid"); opens.Begin(7, 1, 2, now, L"");
+        Check(opens.Empty() && opens.Reliable() && !opens.Finish(0, 0), "invalid or unrelated open operations create no evidence");
+        opens.Begin(7, 1, 2, now, L"missing.dll");
+        Check(!opens.Empty() && !opens.Finish(1, 0xc0000034U) && opens.Empty() && opens.Reliable(),
+              "a failed optional DLL lookup is not a successful file open");
+        opens.Begin(7, 1, 2, now, L"source.bin");
+        const auto opened = opens.Finish(1, 0);
+        Check(opened && opened->pid == 7 && opened->object == 2 && opened->at == now && opened->path == L"source.bin",
+              "successful completion retains the original owner, object, timestamp and path");
+        Check(!opens.Finish(1, 0), "one completion cannot create duplicate evidence");
+        opens.Begin(7, 1, 2, now, L"unreliable.bin");
+        Check(!opens.Finish(1, std::nullopt) && !opens.Reliable(), "a missing completion status makes evidence incomplete");
+        guard::NetFileOpenCache reused;
+        reused.Begin(7, 1, 2, now, L"old.bin"); reused.Begin(8, 1, 3, now + 1, L"new.bin");
+        Check(!reused.Reliable() && reused.Finish(1, 0)->pid == 8, "unmatched IRP reuse replaces its stale owner and fails closed");
+        guard::NetFileOpenCache zeroIrp;
+        zeroIrp.Begin(7, 0, 2, now, L"unknown.bin");
+        Check(!zeroIrp.Reliable() && zeroIrp.Empty(), "a selected open without an IRP cannot be certified");
+        guard::NetFileOpenCache pending;
+        for (std::uint64_t i = 1; i <= 4097; ++i) { pending.Begin(7, i, i, now, L"pending.bin"); }
+        Check(!pending.Reliable() && !pending.Finish(1, 0) && pending.Finish(4097, 0).has_value(),
+              "pending-open correlation is bounded and reports lost operations");
         guard::NetFileActivityCache cache;
         cache.Record(0, now, L"ignored.txt");
         cache.Record(7, 0, L"ignored.txt");
@@ -200,6 +224,27 @@ class Tests {
         for (std::uint64_t i = 0; i < 1100; ++i) { cache.Record(7, now + i, std::to_wstring(i)); }
         const auto bounded = cache.Paths(7, now, now + 1100);
         Check(bounded.size() == 1024 && bounded.front() == L"76" && bounded.back() == L"1099", "file evidence cache evicts oldest records at its capacity");
+        Check(!cache.Complete(7, now, now + 1100), "relevant evicted evidence remains incomplete");
+        Check(cache.Complete(8, now, now + 1100), "another process and older losses do not poison a transfer");
+        Check(cache.Complete(7, now + 76, now + 1100), "a transfer after the lost records has complete history");
+        Check(!cache.Complete(7, now, now - 1), "a future loss watermark remains conservative");
+        Check(cache.Complete(7, now, now + 31ULL * 10000000), "expired losses no longer poison later transfers");
+        guard::NetFileActivityCache expired;
+        for (std::uint64_t i = 0; i < 1024; ++i) { expired.Record(7, now, std::to_wstring(i)); }
+        expired.Record(7, now + 31ULL * 10000000, L"new.bin");
+        Check(expired.Evictions() == 0 && expired.Paths(7, now, now + 31ULL * 10000000).size() == 1,
+              "expired records are removed before capacity enforcement");
+        guard::NetFileActivityCache losses;
+        for (std::uint64_t i = 1; i <= 2050; ++i) { losses.Record(i, now + i, std::to_wstring(i)); }
+        Check(!losses.Complete(9999, now, now + 2050), "loss-index overflow fails closed for untracked processes");
+        Check(losses.Complete(9999, now + 3, now + 2050), "the fallback watermark is bounded by the lost time interval");
+        Check(!losses.Complete(1026, now, now + 2050), "losses still indexed by process remain incomplete");
+        losses.Record(7, now + 31ULL * 10000000, L"after-expiry.bin");
+        Check(losses.Complete(9999, now, now + 31ULL * 10000000), "overflow fallback and indexed losses expire");
+        guard::NetFileActivityCache boundary;
+        for (std::uint64_t i = 0; i < 1025; ++i) { boundary.Record(7, now, std::to_wstring(i)); }
+        Check(!boundary.Complete(7, now, now + 30ULL * 10000000), "a loss at the thirty-second boundary is relevant");
+        Check(boundary.Complete(7, now, now + 30ULL * 10000000 + 1), "loss expiry is exclusive of the retained boundary");
     }
     static void FileReads() {
         constexpr std::uint64_t now = 134000000000000000ULL;
@@ -223,6 +268,8 @@ class Tests {
         for (std::uint64_t i = 1; i <= 4097; ++i) { cache.Open(9, i + 10, now, std::to_wstring(i)); }
         cache.Read(9, 11, now + 1);
         Check(cache.Evictions() != 0 && cache.Paths(9, now, now + 1).empty(), "object map eviction is bounded and observable");
+        Check(!cache.Complete(9, now, now + 1), "missing live-object associations fail closed");
+        Check(!cache.Complete(9, now, now + 40ULL * 10000000), "an evicted object can still be read after history expiry");
         for (std::uint64_t i = 0; i < 1100; ++i) { cache.Read(9, 11 + i, now + 10 + i); }
         Check(cache.Evictions() > 1, "read history eviction is observable independently of object-map capacity");
         Check(cache.Paths(9, now, now + 40ULL * 10000000).empty(), "read evidence expires after thirty seconds");
@@ -231,6 +278,16 @@ class Tests {
         for (std::uint64_t i = 0; i < 20000; ++i) { bulk.Read(7, 1, now + i); }
         Check(bulk.Evictions() == 0 && bulk.Paths(7, now, now + 20000).size() == 1,
               "bulk reads coalesce evidence instead of poisoning the bounded history");
+        Check(bulk.Complete(7, now, now + 20000), "coalesced read evidence remains complete");
+        guard::NetFileReadCache history;
+        for (std::uint64_t i = 1; i <= 1100; ++i) {
+            history.Open(7, i, now + i, std::to_wstring(i));
+            history.Read(7, i, now + i);
+            history.Close(i);
+        }
+        Check(!history.Complete(7, now, now + 1100), "read-path loss prevents a content verdict");
+        Check(history.Complete(8, now, now + 1100), "read-path loss is scoped to its process");
+        Check(history.Complete(7, now, now + 31ULL * 10000000), "old read-path loss does not permanently block a process");
     }
     static void TraceProgress() {
         using namespace std::chrono_literals;
@@ -517,6 +574,13 @@ class Tests {
               "recent public source remains allowed");
         Check(scanner.Scan(GetCurrentProcessId(), process_created, 8000, {(root / L"missing.bin").wstring()}).verdict == guard::ScanVerdict::Incomplete,
               "unavailable recent source fails closed");
+        const auto unavailable = (root / L"missing.bin").wstring();
+        const auto available = (root / L"public-0.bin").wstring();
+        const auto first_missing = scanner.Scan(GetCurrentProcessId(), process_created, 8000, {unavailable, available}, true);
+        const auto last_missing = scanner.Scan(GetCurrentProcessId(), process_created, 8000, {available, unavailable}, true);
+        Check(first_missing.verdict == guard::ScanVerdict::Incomplete && first_missing.path == unavailable &&
+              last_missing.verdict == guard::ScanVerdict::Incomplete && last_missing.path == unavailable,
+              "incomplete-file diagnostics preserve the failing source rather than the last successful path");
         Check(scanner.Scan(GetCurrentProcessId(), process_created, 8000, {L"\\Device\\NamedPipe\\ignored"}).verdict == guard::ScanVerdict::Clear,
               "non-disk file telemetry is ignored");
         Check(scanner.Scan(GetCurrentProcessId(), process_created, 0, {(root / L"public-0.bin").wstring()}).verdict == guard::ScanVerdict::Incomplete,
