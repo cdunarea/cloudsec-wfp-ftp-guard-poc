@@ -1,10 +1,395 @@
 # Test results and reproduction
 
-Latest live validation: **2026-11-04, America/Edmonton** (2026-11-05 UTC), on **W11Test**.
-Source: `C:\dev\sbg-poc\cloudsec-wfp-ftp-guard-poc` on DEV-11x64.
-These results cover the new on-demand client/server path. No AFA is used.
+Latest validation: **corrective end-to-end tests on W11Test, 2026-11-05 UTC**.
+Source: C:\dev\sbg-poc\cloudsec-wfp-ftp-guard-poc on DEV-11x64.
 
-## Current real end-to-end FTP and explicit FTPS testing
+## Large-file live validation
+
+**The corrected build passes the reference-client FTP/explicit-FTPS matrix.
+Windows curl/Schannel still has an FTPS-upload completion compatibility failure.**
+The latter remains a failed test, even when its receiver hash matches.
+It is not included in the reference-client pass count.
+
+All live transfers and driver loading ran exclusively on **W11Test**. DEV-11x64
+was used for source changes, non-elevated CMake builds and user-mode unit tests.
+Traffic used loopback against the existing SFTPGo service. This simulates a
+remote client pulling files from a protected local server.
+
+### Fixes made after the earlier large-file run
+
+| Finding | Correction |
+| --- | --- |
+| Large content scans exceeded the scan budget | Skip impossible starts with bounded vector comparisons. Avoid repeated searches over the same suffix on dense near-matches. Keep partial ASCII and UTF-16 matches across chunks. Differential, alignment and protected-page regressions cover the optimized matcher. |
+| Repeated reads exhausted recent-file history | Coalesce repeated PID/path observations. Distinct-path eviction remains observable and conservative. |
+| File-evidence delivery repeatedly stalled | Use shared ETW producer buffering for the file session. Retain explicit flush, consumed-buffer condition-variable barriers, loss checks and bounded waits. Ignore the scanner's own file events before decoding. |
+| FTPS rescanned whole files on successive indications | Keep a bounded positive-scan cache. Check process instance, flow, canonical path, file identity, size, write/change times and NTFS USN before reuse. New paths still require inspection. |
+| A replacement race could pair one file's verdict with another file's identity | Scan the same sharing-protected object whose identity is cached. Incompatible writers and unsupported change-journal evidence fall back to full scanning. |
+| Public streams stalled or truncated during reinjection | Submit reinjection asynchronously. Account for queued and in-flight bytes together. Retain flow/segment ownership through completion, preserve direction ordering, fence FIN behind preceding injections, and drain callbacks during teardown. |
+| Incoming TLS records waited behind outgoing file policy | Drain the receive queue promptly, independently of the sending verdict. Both directions retain clone/block/reinject processing throughout a tracked flow. |
+| FTPS client errors could be confused with successful delivery | Require both client exit 0 and a matching receiver SHA-256 for an allowed transfer. Record the selected curl version/backend and binary hash. Keep Windows curl compatibility results separate. |
+
+These changes do not decrypt TLS. They do not add AFA or an application allow list.
+
+### Final-build results
+
+| Group | Passed / checks |
+| --- | ---: |
+| Debug-100MiB | 12 / 12 |
+| Debug-100MiB-dense | 12 / 12 |
+| Debug-1024MiB | 12 / 12 |
+| Debug-1024MiB-dense | 12 / 12 |
+| Debug-small | 36 / 36 |
+| Final-Baselines | 12 / 12 |
+| Lifecycle-and-reuse | 3 / 3 |
+| Missing-file-evidence | 4 / 4 |
+| Release-100MiB | 36 / 36 |
+| Release-100MiB-dense | 12 / 12 |
+| Release-1024MiB | 36 / 36 |
+| Release-1024MiB-dense | 12 / 12 |
+| Release-small | 36 / 36 |
+| Repeated-1GiB-FTP-pulls | 6 / 6 |
+| Repeated-1GiB-FTPS | 4 / 4 |
+| Screenshots | 10 / 10 |
+| Windows-curl-compatibility | 5 / 6 |
+
+The reference curl client is the official **8.23.0 / LibreSSL 4.4.0** Windows
+build. Native **Windows ftp.exe** remains the active-mode plain-FTP client.
+The full matrix also includes the existing .NET explicit-FTPS download cases.
+The Windows-supplied curl **8.21.0 / Schannel** is tested separately below.
+The temporary reference client is removed from W11Test after collection.
+
+The full Release matrices exercise plain FTP, protected-data explicit FTPS,
+and TLS control with plaintext data. They cover client uploads and local-server
+pulls, active/passive data connections, and control ports **21 and 49237**.
+The larger Debug matrices cover the four core client/server FTP/FTPS paths.
+The same signed driver is used with both console configurations.
+
+### Large files and receiver assertions
+
+Files are fully written **100 MiB (104,857,600-byte)** and
+**1 GiB (1,073,741,824-byte)** fixtures. Filler public files contain ASCII P bytes.
+Sensitive-name fixtures have public content. Sensitive-content fixtures have a
+neutral name and mixed-case SeCrEt near EOF. Some also begin with a misleading
+220-style data header.
+
+The content marker starts three bytes before the final 64 KiB boundary, at
+offset **104,792,061** or **1,073,676,285**. The scanner must carry its match
+across that boundary. Receiver size, existence and SHA-256 are recorded per case.
+
+Additional dense fixtures interleave many S starts, SecreX near-matches and
+UTF-16-like S/zero bytes. They contain no marker unless the intentional late
+marker is inserted. These checks guard against a fast path that works only for
+uniform filler. The core matrix repeats them in both builds and at both sizes.
+
+| Sensitive fixture population | Checks | Absent | Empty | Non-empty |
+| --- | ---: | ---: | ---: | ---: |
+| 100 MiB, filler | 33 | 17 | 16 | 0 |
+| 100 MiB, dense | 16 | 8 | 8 | 0 |
+| 1024 MiB, filler | 33 | 17 | 16 | 0 |
+| 1024 MiB, dense | 16 | 8 | 8 | 0 |
+| 1 GiB screenshot checks | 6 | 3 | 3 | 0 |
+
+An allow requires client completion and an exact receiver hash match. A sensitive
+pass requires an accepted secret-name/content verdict for the intended source
+and zero receiver file bytes. An incomplete scan does not count as detection.
+Missing-ETW checks deliberately require the separate inspection-incomplete rule.
+
+**Zero receiver bytes can mean an absent or empty destination.** A client or
+server may create an empty destination before policy blocks the transfer.
+FTP control commands, TLS handshakes and metadata can already have crossed the
+network. These are receiver-file assertions, not packet-capture proof of zero
+network traffic or a guarantee that no destination entry was created.
+
+### Public-transfer timings
+
+| Release public case | Size | Pattern | Client time | Receiver hash |
+| --- | ---: | --- | ---: | --- |
+| FTP server (ftp.exe) | 100 MiB | filler | 0.44 s | Matched |
+| FTP client (ftp.exe) | 100 MiB | filler | 1.66 s | Matched |
+| FTPS server (curl.exe) | 100 MiB | filler | 2.76 s | Matched |
+| FTPS client (curl.exe) | 100 MiB | filler | 3.66 s | Matched |
+| FTP server (ftp.exe) | 100 MiB | dense | 0.75 s | Matched |
+| FTP client (ftp.exe) | 100 MiB | dense | 1.68 s | Matched |
+| FTPS server (curl.exe) | 100 MiB | dense | 3.20 s | Matched |
+| FTPS client (curl.exe) | 100 MiB | dense | 2.99 s | Matched |
+| FTP server (ftp.exe) | 1024 MiB | filler | 2.51 s | Matched |
+| FTP client (ftp.exe) | 1024 MiB | filler | 17.21 s | Matched |
+| FTPS server (curl.exe) | 1024 MiB | filler | 27.72 s | Matched |
+| FTPS client (curl.exe) | 1024 MiB | filler | 35.49 s | Matched |
+| FTP server (ftp.exe) | 1024 MiB | dense | 2.54 s | Matched |
+| FTP client (ftp.exe) | 1024 MiB | dense | 14.53 s | Matched |
+| FTPS server (curl.exe) | 1024 MiB | dense | 30.25 s | Matched |
+| FTPS client (curl.exe) | 1024 MiB | dense | 34.33 s | Matched |
+
+Timings are observations from this lab. They are not production throughput
+guarantees. FTPS still checks fresh file evidence on outgoing indications.
+A cache hit avoids another content scan; it does not bypass the ETW delivery
+barrier, source selection, process verification or the scan deadline.
+
+### Windows curl compatibility results
+
+The final Windows curl check passed **5/6**. Downloads passed. Failed upload checks: **1**. The failure was curl exit 18 / SEC_E_CONTEXT_EXPIRED after writing a complete, matching 100 MiB receiver file. No secret policy block was involved. A matching file does not turn this completion failure into a successful allow.
+
+Changing the TLS version and disabling curl's session cache did not resolve the
+error in exploratory checks. Repeated PoC-off uploads completed successfully.
+The separate LibreSSL client completed the guarded transfers. This narrows the
+interoperability problem but does not establish its exact root cause. The PoC
+changes traffic timing, so this report does not attribute the failure solely to
+curl or solely to the driver.
+
+Curl FTPS downloads use --ignore-content-length to read through TLS EOF.
+This also resolved the earlier PoC-off download completion/reset symptom in a
+controlled check. Receiver hashes and client success remain mandatory.
+Certificate and hostname checks remain enabled against the configured lab CA.
+
+### Additional regressions and screenshots
+
+- **Missing file evidence:** 4/4 checks block as inspection-incomplete with ETW disabled.
+- **Active-transfer teardown:** both public transfers drain and unload after an intentional stop. Partial receiver files and client failure are expected in these shutdown tests.
+- **Same FTPS control session:** a public upload succeeds, followed by an accepted sensitive-content block for a newly read file. The second receiver has zero file bytes.
+- **Screenshots:** 10/10 additional 1 GiB checks pass. Six use native ftp.exe; four use the reference curl client for explicit FTPS.
+
+The screenshot group contains genuine console-window captures from W11Test,
+made with the supplied Windows UI helper. A live viewer displays the elevated
+loader's actual output. Captions identify the transfer client and protected role.
+The saved console transcript and receiver assertions accompany each capture.
+Screenshots are not substitutes for the receiver/hash assertions.
+
+### Build and coverage
+
+The standalone CMake solution builds in Debug and Release on DEV-11x64 from a
+non-elevated interactive task. CTest passes **15,909 assertions** in each
+configuration. Signing and whitespace checks also pass.
+
+| Instrumented component | Executed source lines |
+| --- | ---: |
+| SecretMatcher | 54/54 |
+| NetTransferGate and transfer parser | 39/39 |
+| File-activity history | 42/43 |
+| FileScanner implementation | 197/213 |
+| FileScanner header | 2/2 |
+
+This is user-mode line coverage. It is not 100% branch coverage or instrumented
+kernel-driver coverage. Remaining native error paths are not claimed as tested.
+Live transfer and intentional-unload checks validate the kernel paths exercised.
+
+| Tested binary | SHA-256 |
+| --- | --- |
+| Debug/ftp-guard.exe | `02FADFD3F356052FA69212C46440BC5F8FD9F9595040452AB84B6F0EB89C0DFA` |
+| Release/ftp-guard.exe | `DAB5F1FFFCAD65CE90544698D60DE93FCDBA5307A7A19A437257EFE6803F5C24` |
+| driver/WfpFtpGuard.sys | `CFB65A015A4EF2FCE3AEC45FF35CFED7CF0E179DE47A2EC4442C1A4D783B39ED` |
+
+### Evidence, cleanup and remaining scope
+
+Sanitized results, transcripts, screenshots and aggregate records are retained
+on W11Test under **C:\dev\tests\ftp-large-fix-20261105T022830Z**.
+Final-build results are in the Final folder. Earlier candidates and failures are
+kept separately, with their own hashes. They are not merged into final pass counts.
+Credentials and unrelated implementation-script names are excluded.
+
+Cleanup is verified: no PoC driver service, owned helper/viewer processes, temporary tasks, transient files, transfer fixtures or PoC ETW sessions remain. SFTPGo is running. Its existing configuration and the explicitly requested account file are preserved. Only sanitized evidence remains from this run.
+
+This run does not qualify an external peer, KDF/VPN coexistence, IPv6, concurrent
+sessions, arbitrary document formats, mutable/mapped files, or adversarial
+file-to-socket attribution. FTPS coverage remains conditional on observed file
+activity. Cached, mapped or memory-generated data without observed source reads
+can escape this path. Implicit FTPS is outside FTP qualification.
+
+Future KDF/VPN validation must inventory providers, layers and sublayer weights.
+Repeat real FTP allow/block checks with KDF loaded, VPN connected/disconnected,
+split/full tunnels, redirects/proxies, IPv4/IPv6 and reconnects. Check originating
+process attribution and receiver state. Callback delivery alone is insufficient.
+
+Positive file verdicts are bounded to 64 entries and 30 seconds. Their temporary
+sharing leases can briefly affect new writers. Unsupported NTFS USN queries force
+full scans. The driver has a 16 MiB queued/in-flight bound per tracked flow.
+FTPS still receives no permanent data-flow grant; a certificate or old public
+source must not authorize a newly observed sensitive source.
+
+References: [Microsoft's stream-inspection contract](https://learn.microsoft.com/en-us/windows-hardware/drivers/network/stream-inspection),
+[NTFS file-USN query](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-fsctl_read_file_usn_data),
+and [official curl Windows builds](https://curl.se/windows/).
+
+### Reproduce the current large-file checks
+
+Build and sign on DEV as described in the build instructions below. Deploy the
+matching package and the transfer harness to W11Test. Keep SFTPGo's existing
+account and lab CA configuration. Run the harness elevated on W11Test.
+Supply the separate reference curl executable through `-CurlPath`. The default
+is the Windows-supplied curl, whose compatibility outcome is recorded above.
+
+```powershell
+.\tests\Invoke-TransferTests.ps1 -BinaryRoot C:\dev\tmp-scripts\ftp-binaries -WorkRoot C:\dev\tmp-scripts\ftp-large-100 -ResultRoot C:\dev\tests\fresh-large-100 -Configuration Release -FileSizeMiB 100 -ClientTimeoutSeconds 120 -CurlPath C:\dev\tmp-scripts\curl\curl.exe
+```
+
+Use `-FileSizeMiB 1024` for 1 GiB files. Add `-FilePattern dense` for the dense
+near-match fixtures. Use a fresh results folder for every invocation.
+The core client/server FTP/FTPS selection is
+`-CaseFilter '01,02,03,07,08,09,13,14,15,19,20,21'`.
+Use `-Repeat` for completion repeats. Keep receiver-hash and intended-secret
+assertions enabled. Do not count client failure as an allow.
+
+## Earlier large-file validation, before these fixes
+
+The following failed run is retained for comparison. Its old binaries and
+timings do not describe the final reference-client results above.
+
+Tested exclusively on **W11Test** on 2026-11-05 UTC
+(2026-11-04 in America/Edmonton). DEV-11x64 supplied the existing signed binaries.
+No live transfers or driver loading ran on DEV.
+
+**Sensitive-file enforcement passed all 16 checks. Large public-file support did
+not fully pass.** The run contains 30 protected large-file checks, 12 initial
+PoC-off baselines, and two PoC-off completion-error repeats. The strict aggregate
+is **33/44**. Three additional small-file checks passed to validate the extended
+test harness. Failures remain recorded.
+
+The Release console and driver are unchanged from the small-file run below.
+No production C++ changes or rebuild were made for this validation.
+
+### Files and assertions
+
+Files were **100 MiB (104,857,600 bytes)** and **1 GiB (1,073,741,824 bytes)**.
+They were fully written local files, without sparse allocation. They remained
+unchanged during each transfer.
+
+| Fixture | Filename policy | Content |
+| --- | --- | --- |
+| Public | Neutral filename | Repeated ASCII P bytes; no sensitive marker |
+| Sensitive filename | Contains secret | Same public content |
+| Sensitive content | Neutral filename | Mixed-case SeCrEt near the end |
+
+The content marker begins three bytes before a 64 KiB boundary near EOF.
+Offsets are **104,792,061** and **1,073,676,285** respectively. The matcher must
+carry state across the boundary. It reads the final chunk before detecting the
+marker. Fixture sizes, offsets and SHA-256 hashes are retained in the evidence.
+
+An allowed transfer requires client completion and a receiver SHA-256 match.
+A sensitive pass requires an accepted secret-name/content decision for the
+intended source, plus zero receiver file bytes. An inspection-incomplete block
+does not count as sensitive-content detection.
+
+**Zero receiver bytes does not require an absent destination.** FTP commands,
+TLS records and file metadata may already have crossed the network. A download
+client or server can create an empty destination before receiving file content.
+These assertions validate receiver files; they are not a packet-capture claim
+of zero network traffic.
+
+### Main matrix
+
+Each row contains public, sensitive-name and near-end-content cases.
+Plain FTP uses native Windows ftp.exe in active mode on port 21. Explicit FTPS
+uses Windows curl in passive mode with protected data, on port 21.
+
+| Size | Protected role | Protocol | Public | Sensitive name | Near-end content |
+| --- | --- | --- | --- | --- | --- |
+| 100 MiB | Local server, remote pull | FTP | Hash matched | Blocked, 0 bytes | Blocked, 0 bytes |
+| 100 MiB | Local client, upload | FTP | Hash matched | Blocked, 0 bytes | Blocked, 0 bytes |
+| 100 MiB | Local server, remote pull | Explicit FTPS | 120-second timeout | Blocked, 0 bytes | Blocked, 0 bytes |
+| 100 MiB | Local client, upload | Explicit FTPS | 120-second timeout | Blocked, 0 bytes | Blocked, 0 bytes |
+| 1 GiB | Local server, remote pull | FTP | Truncated; hash mismatch | Blocked, 0 bytes | Blocked, 0 bytes |
+| 1 GiB | Local client, upload | FTP | Hash matched | Blocked, 0 bytes | Blocked, 0 bytes |
+| 1 GiB | Local server, remote pull | Explicit FTPS | 120-second timeout | Blocked, 0 bytes | Blocked, 0 bytes |
+| 1 GiB | Local client, upload | Explicit FTPS | 120-second timeout | Blocked, 0 bytes | Blocked, 0 bytes |
+
+The initial matrices passed **10/12** at 100 MiB and **9/12** at 1 GiB.
+The two sizes and both sensitive fixture types give the following destination
+states across the 16 sensitive checks:
+
+| Protected role and protocol | Sensitive checks | Receiver file state | File-content bytes |
+| --- | ---: | --- | ---: |
+| FTP server, native-client pull | 4 | Empty file | 0 |
+| FTP client, native-client upload | 4 | Absent | 0 |
+| FTPS server, curl pull | 4 | Absent | 0 |
+| FTPS client, curl upload | 4 | Empty file | 0 |
+
+Thus eight sensitive checks left an empty file, and eight left no file.
+None left a non-empty destination. Empty-file prevention is not provided by
+this network guard.
+
+### Findings requiring follow-up
+
+**Plain FTP, 1 GiB server pulls are not reliably qualified.** The initial
+native-client pull received only **252,805,106 bytes**, despite a clear source
+verdict. Its driver log recorded data-submit status **0xC0000225**.
+Two later native-client repeats completed with matching 1 GiB hashes. This is
+intermittent, rather than a demonstrated universal size limit.
+
+Two passive curl pull repeats on port 49237 also failed: one received
+**381,583,360 bytes**; the other blocked with zero bytes after the existing
+eight-second scan budget expired. That latter scan inspected **416,153,600 bytes**
+and reported inspection-incomplete, without claiming sensitive content.
+The two matching curl upload repeats completed. Follow-up transfers passed **4/6**.
+The streaming/queue/teardown cause of the truncated pulls is not established.
+A DRIVER CLOSED event and an allow verdict do not prove successful delivery.
+
+**Large explicit FTPS public transfers are impractically slow in this design.**
+All four hit curl's 120-second limit with incomplete destination files.
+Repeated whole-file scans and ETW delivery waits occur on later outgoing
+indications; FTPS deliberately has no retained data-flow grant.
+
+| Public FTPS case | Inspections | Total bytes scanned | Receiver file bytes after 120 seconds |
+| --- | ---: | ---: | ---: |
+| 100 MiB server pull | 85 | 8,912,896,000 | 6,668,288 |
+| 100 MiB client upload | 90 | 9,332,360,588 | 2,244,608 |
+| 1 GiB server pull | 26 | 27,917,287,424 | 1,949,696 |
+| 1 GiB client upload | 25 | 25,769,814,654 | 557,056 |
+
+Curl reported exit 28 in these cases. The early matrix watchdog flag describes
+whether the outer process supervisor killed curl; it remains false when curl's
+own limit fires. The aggregate also records ClientTimeLimitReached explicitly.
+The extended harness now reports either timeout source as ClientTimedOut.
+
+**PoC-off baselines distinguish these problems from basic transfer support.**
+All 12 initial baselines delivered the complete files with matching hashes,
+including native 1 GiB FTP uploads/downloads. Ten also returned successful client
+completion. The two FTPS downloads returned curl exit 56 after receiving the full
+matching files. Two further PoC-off repeats reproduced that completion error:
+Recv failure: Connection was aborted. Their files also matched.
+
+That FTPS completion/reset anomaly exists without this PoC. It is recorded
+separately from the PoC's 120-second partial-transfer timeouts. No specific TLS
+close-notify or underlying server/client cause is established here.
+
+### Scope and evidence
+
+All traffic used W11Test loopback against its SFTPGo 2.7.6 instance. This simulates
+a remote pull. The tests do not qualify an external host, VPN/KDF, IPv6,
+concurrent sessions, mutable files or arbitrary document formats.
+
+FTPS source selection remains file-I/O/process/peer correlation. WFP does not
+decrypt TLS. Cached or unobserved source reads can still escape this conditional
+path, as described in the coverage boundaries below.
+
+Sanitized results on W11Test:
+
+`C:\dev\tests\ftp-large-20261105T020141Z`
+
+The aggregate, individual cases, environment, fixture hashes and console logs
+are retained. ReceiverExists and ReceiverState distinguish absent and empty
+destinations. For the first matrix, these explicit fields were derived from
+the already captured receiver hash: null means absent; the empty-file SHA-256
+means an existing empty file.
+
+Owned payloads, deployed binaries and transient utilities are removed after
+collection. SFTPGo and its existing account/TLS configuration remain.
+
+### Reproduce large-file transfers
+
+Use the existing build/signing and lab prerequisites below. Run this harness
+on W11Test, from an elevated console. It reads the existing local account file.
+
+```powershell
+.\tests\Invoke-TransferTests.ps1 -BinaryRoot C:\dev\tmp-scripts\ftp-lab-binaries -WorkRoot C:\dev\tmp-scripts\ftp-large-100-work -ResultRoot C:\dev\tests\fresh-large-100 -Configuration Release -CaseFilter '01,02,03,07,08,09,13,14,15,19,20,21' -FileSizeMiB 100 -ClientTimeoutSeconds 120
+```
+
+Repeat with FileSizeMiB 1024 and fresh work/results directories.
+CaseFilter '01,04,16' with Repeat 2 reproduces the additional 1 GiB plaintext
+checks. FileSizeMiB 0 preserves the earlier small fixtures.
+The test time limit changes client/watchdog duration; it does not increase the
+driver's 15-second decision deadline or the scanner's eight-second budget.
+
+## Previous small-file end-to-end FTP and explicit FTPS testing
 
 **123/123 final live checks passed.** The primary transfer suite is **72 matrix
 checks plus 40 repeated explicit FTPS checks**. Six further checks produced live
@@ -118,7 +503,7 @@ permissions, TLS setup or server availability. No customer files were used.
 The unsupported curl test option used during discovery was removed. Final curl
 tests use supported options. The .NET cases independently verify `AUTH TLS`.
 
-## Build and unit validation
+## Earlier build and unit validation
 
 CMake Debug/Release builds, CTest and driver signing passed on DEV-11x64 under a
 **non-elevated** user token. Compiler warnings are errors.
@@ -189,7 +574,7 @@ stays elevated in Session 0. The viewer and screenshot agent run without
 elevation and display live, unmodified loader output. Remove owned runtime
 directories after testing; keep sanitized reports only.
 
-## Evidence and interpretation
+## Small-file evidence and interpretation
 
 Final W11Test results:
 

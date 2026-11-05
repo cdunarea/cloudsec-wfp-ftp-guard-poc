@@ -13,6 +13,12 @@ class NetFileActivityCache {
  public:
     void Record(std::uint64_t pid, std::uint64_t at, std::wstring path) {
         if (pid == 0 || at == 0 || path.empty()) { return; }
+        const auto previous = std::find_if(events_.begin(), events_.end(),
+            [&](const auto& event) { return event.pid == pid && event.path == path; });
+        if (previous != events_.end()) {
+            if (previous->at >= at) { return; }
+            events_.erase(previous);
+        }
         if (events_.size() >= kCapacity) { events_.pop_front(); ++evictions_; }
         events_.push_back({pid, at, std::move(path)});
     }

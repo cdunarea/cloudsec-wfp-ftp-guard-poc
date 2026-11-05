@@ -5,6 +5,10 @@ param(
  [ValidateSet('Debug','Release')][string]$Configuration='Debug',
  [string]$CaseFilter='',
  [ValidateRange(1,20)][int]$Repeat=1,
+ [ValidateRange(0,2048)][int]$FileSizeMiB=0,
+ [ValidateSet('filler','dense')][string]$FilePattern='filler',
+ [ValidateRange(10,1800)][int]$ClientTimeoutSeconds=20,
+ [string]$CurlPath='C:\Windows\System32\curl.exe',
  [string]$LiveViewState='',
  [string]$CaptureHelper='',
  [switch]$NoEtw,
@@ -28,7 +32,9 @@ $statePath=Join-Path $WorkRoot 'progress.json'
 $server='C:\Program Files\SFTPGo\sftpgo.exe'
 $serverHome='C:\dev\SFTPGoData\root'
 $cert='C:\ProgramData\SFTPGo\tls\ftp-lab-cert.pem'
-$curl='C:\Windows\System32\curl.exe'
+$curl=(Resolve-Path -LiteralPath $CurlPath).Path
+$curlVersion=@(& $curl --version)[0]
+if($LASTEXITCODE -ne 0){throw 'Could not identify the selected curl client'}
 $ftp='C:\Windows\System32\ftp.exe'
 $guard=Join-Path $BinaryRoot ($Configuration+'\ftp-guard.exe')
 $driver=Join-Path $BinaryRoot 'driver\WfpFtpGuard.sys'
@@ -56,7 +62,7 @@ function Run-Client([string]$exe,[string]$arguments,[string]$inputText){
  $p=[Diagnostics.Process]::Start($s);$out=$p.StandardOutput.ReadToEndAsync();$err=$p.StandardError.ReadToEndAsync()
  try{
   $p.StandardInput.Write($inputText);$p.StandardInput.Close()
-  $timeout=-not $p.WaitForExit(25000)
+  $timeout=-not $p.WaitForExit(($ClientTimeoutSeconds+5)*1000)
   if($timeout){$p.Kill();$p.WaitForExit()}
   return [pscustomobject]@{Code=$p.ExitCode;TimedOut=$timeout;Output=(Sanitize ($out.Result+$err.Result))}
  }finally{$p.Dispose()}
@@ -92,7 +98,7 @@ public static class NetFtpPinnedTls {
   $request.Credentials=[Net.NetworkCredential]::new('root',$password)
   $request.Method=[Net.WebRequestMethods+Ftp]::DownloadFile
   $request.EnableSsl=$true;$request.UseBinary=$true;$request.UsePassive=$true
-  $request.KeepAlive=$false;$request.Timeout=20000;$request.ReadWriteTimeout=20000;$request.Proxy=$null
+  $request.KeepAlive=$false;$request.Timeout=$ClientTimeoutSeconds*1000;$request.ReadWriteTimeout=$ClientTimeoutSeconds*1000;$request.Proxy=$null
   $response=$request.GetResponse()
   $stream=$response.GetResponseStream();$file=[IO.File]::Create($destination)
   $stream.CopyTo($file)
@@ -118,9 +124,9 @@ function Invoke-Case($case){
  $eventName='Local\NetFtpCase-'+[Guid]::NewGuid().ToString('N')
  $stop=[Threading.EventWaitHandle]::new($false,[Threading.EventResetMode]::ManualReset,$eventName)
  $application=if($case.Role -eq 'server'){$server}elseif($case.Client -eq 'native'){$ftp}else{$curl}
- $arguments='--driver "'+$driver+'" --app "'+$application+'" --seconds 90 --stop-event "'+$eventName+'"'
+ $arguments='--driver "'+$driver+'" --app "'+$application+'" --seconds '+($ClientTimeoutSeconds+45)+' --stop-event "'+$eventName+'"'
  if($NoEtw){$arguments+=' --no-etw'}
- $process=$null;$client=$null;$fatal=$null;$captureError=$null
+ $process=$null;$client=$null;$fatal=$null;$captureError=$null;$transfer=[Diagnostics.Stopwatch]::new()
  try{
   $process=Start-Process -FilePath $guard -ArgumentList $arguments -WorkingDirectory $WorkRoot -WindowStyle Hidden -PassThru -RedirectStandardOutput $log -RedirectStandardError $err
   $null=$process.Handle
@@ -132,6 +138,7 @@ function Invoke-Case($case){
    $null=$stop.WaitOne(50)
   }while($true)
   if($LiveViewState){[IO.File]::WriteAllText($LiveViewState,(@{Log=$log;Case=$case.Id;Client=$case.Client;Protocol=$case.Protocol;Role=$case.Role;Stop=$false}|ConvertTo-Json),$utf8)}
+  $transfer.Start()
   if($case.Client -eq 'native'){
    $operation=if($case.Role -eq 'server'){'get "'+$remote+'" "'+$download+'"'}else{'put "'+$source+'" "'+$remote+'"'}
    $inputText="open 127.0.0.1 "+$case.Port+"`r`nuser root "+$password+"`r`nbinary`r`n"+$operation+"`r`nquit`r`n"
@@ -140,9 +147,11 @@ function Invoke-Case($case){
   }elseif($case.Client -eq 'dotnet'){
    $client=Run-DotNetDownload $case.Port $remote $download
   }else{
-   $request='--config - --silent --show-error --connect-timeout 5 --max-time 20 --disable-epsv '
+   $request='--config - --silent --show-error --connect-timeout 5 --max-time '+$ClientTimeoutSeconds+' --disable-epsv '
    if($case.Mode -eq 'active'){$request+='--ftp-port - --disable-eprt '}else{$request+='--ftp-pasv '}
    if($case.Protocol -eq 'FTPS'){$request+='--ssl-reqd --cacert "'+$cert+'" --ssl-no-revoke '}
+   # Read through TLS close_notify instead of ending Schannel reads at FTP SIZE.
+   if($case.Protocol -eq 'FTPS' -and $case.Role -eq 'server'){$request+='--ignore-content-length '}
    if($case.Protocol -eq 'FTPS-C'){$request+='--ftp-ssl-control --cacert "'+$cert+'" --ssl-no-revoke '}
    if($case.Role -eq 'server'){$request+='--output "'+$download+'" '}else{$request+='--upload-file "'+$source+'" '}
    $request+='"ftp://127.0.0.1:'+$case.Port+'/'+$remote+'"'
@@ -150,6 +159,7 @@ function Invoke-Case($case){
    $client=Run-Client $curl $request ('user = "root:'+$escaped+"`"`r`n")
    $escaped=$null
   }
+  $transfer.Stop()
   if($CaptureHelper){
    try{
     $marker=if($case.Fixture -eq 'public'){'[ALLOW]'}else{'[BLOCK]'}
@@ -172,6 +182,7 @@ function Invoke-Case($case){
   }
  }catch{$fatal=Sanitize $_.Exception.Message}
  finally{
+  $transfer.Stop()
   $null=$stop.Set()
   if($process){
    if(-not $process.WaitForExit(20000)){$fatal='Guard did not drain/unload within 20 seconds';$process.Kill();$process.WaitForExit()}
@@ -193,6 +204,12 @@ function Invoke-Case($case){
  $bytes=if(Test-Path -LiteralPath $destination){(Get-Item -LiteralPath $destination).Length}else{0L}
  $hash=if(Test-Path -LiteralPath $destination){(Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash}else{$null}
  $expected=(Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
+ $sourceBytes=(Get-Item -LiteralPath $source).Length
+ $scannedBytes=0L
+ foreach($match in [regex]::Matches($text,'scanned_bytes=(\d+)')){$scannedBytes+=[int64]$match.Groups[1].Value}
+ $cacheHits=0L
+ foreach($match in [regex]::Matches($text,'cached_files=(\d+)')){$cacheHits+=[int64]$match.Groups[1].Value}
+ $etwWaits=@([regex]::Matches($text,'(?m)^\[ETW SYNC\].*elapsed_ms=(\d+)')|ForEach-Object {[int64]$_.Groups[1].Value})
  $isBlock=$ExpectIncomplete -or $case.Fixture -ne 'public'
  $pass=($null -eq $fatal) -and ($null -eq $captureError) -and $guardExit -eq 0 -and $confirmed -and $dataInspection -and
        ($case.Protocol -eq 'FTP' -or $tlsRecognized) -and
@@ -201,14 +218,23 @@ function Invoke-Case($case){
  $result=[pscustomobject][ordered]@{
   Id=$case.Id;Configuration=$Configuration;Role=$case.Role;Protocol=$case.Protocol;ProtectedApplication=[IO.Path]::GetFileName($application)
   TransferClient=if($case.Client -eq 'native'){'ftp.exe'}elseif($case.Client -eq 'dotnet'){'System.Net.FtpWebRequest'}else{'curl.exe'}
+  TransferClientVersion=if($case.Client -eq 'curl'){$curlVersion}else{$null}
   Operation=if($case.Role -eq 'server'){'RETR remote pull'}else{'STOR upload'}
   DataMode=$case.Mode;Port=$case.Port;Fixture=$case.Fixture
+  DownloadLengthMode=if($case.Client -eq 'curl' -and $case.Protocol -eq 'FTPS' -and $case.Role -eq 'server'){'read-to-EOF; receiver hash required'}else{'client default'}
+  SourceBytes=$sourceBytes;SourceSHA256=$expected;SourcePattern=$FilePattern
+  SensitiveContentOffset=if($FileSizeMiB -gt 0 -and $case.Fixture -in 'content','banner-content'){[int64]$FileSizeMiB*1MB-65536-3}else{$null}
+  TransferMilliseconds=$transfer.ElapsedMilliseconds;ClientTimeLimitSeconds=$ClientTimeoutSeconds
+  InspectionCount=[regex]::Matches($text,'(?m)^\[TRANSFER INSPECTION\]').Count;TotalScannedBytes=$scannedBytes
+  CachedFileChecks=$cacheHits;EtwWaitTotalMilliseconds=($etwWaits|Measure-Object -Sum).Sum;EtwWaitMaximumMilliseconds=($etwWaits|Measure-Object -Maximum).Maximum
   TlsNegotiation=if($case.Protocol -eq 'FTP'){'none'}elseif($case.Client -eq 'dotnet'){'AUTH TLS (FtpWebRequest.EnableSsl)'}else{'curl default; AUTH SSL compatibility uses TLS'}
   Expected=if($ExpectIncomplete){'block-incomplete'}elseif($isBlock){'block'}else{'allow'};Passed=$pass
   FtpRecognized=$confirmed;ExplicitTlsRecognized=$tlsRecognized;OnDemandScan=$dataInspection
   SecretDecision=$blocked;IncompleteDecision=$incomplete;SourceFileMatched=$sourceMatched;ReceiverBytes=$bytes;ReceiverSHA256=$hash
+  ReceiverExists=($null -ne $hash);ReceiverState=if($null -eq $hash){'absent'}elseif($bytes -eq 0){'empty'}else{'contains-data'}
   SHA256Matched=($hash -eq $expected);ClientExit=if($client){$client.Code}else{-1}
-  ClientTimedOut=if($client){$client.TimedOut}else{$false};GuardExit=$guardExit
+  ClientTimedOut=if($client){$client.TimedOut -or ($case.Client -eq 'curl' -and $client.Code -eq 28)}else{$false}
+  WatchdogKilledClient=if($client){$client.TimedOut}else{$false};GuardExit=$guardExit
   Unloaded=$text.Contains('[DRIVER] unloaded');Error=$fatal;CaptureError=$captureError
  }
  [IO.File]::WriteAllText((Join-Path $ResultRoot ($case.Id+'-console.txt')),$text,$utf8)
@@ -247,10 +273,29 @@ try{
   }
   $cases=$expanded
  }
- [IO.File]::WriteAllBytes((Join-Path $WorkRoot 'public.bin'),[Text.Encoding]::UTF8.GetBytes(('Public business transfer data. '+[Environment]::NewLine)*4096))
- Copy-Item -LiteralPath (Join-Path $WorkRoot 'public.bin') -Destination (Join-Path $WorkRoot 'secret-name.bin')
- [IO.File]::WriteAllBytes((Join-Path $WorkRoot 'content.bin'),[Text.Encoding]::UTF8.GetBytes(('A'*65533)+'SeCrEt'+('Z'*65536)))
- [IO.File]::WriteAllBytes((Join-Path $WorkRoot 'banner-content.bin'),[Text.Encoding]::UTF8.GetBytes('220 Public-looking data header'+"`r`n"+('A'*65533)+'SeCrEt'))
+ if($FileSizeMiB -gt 0){
+  $block=[Text.Encoding]::ASCII.GetBytes('P'*1MB)
+  if($FilePattern -eq 'dense'){
+   $seed='xxSxSecreX'+'S'+[char]0+'S'+[char]0
+   $dense=[Text.Encoding]::ASCII.GetBytes($seed * [int][Math]::Ceiling(1MB / $seed.Length))
+   [Array]::Copy($dense,$block,$block.Length)
+  }
+  $length=[int64]$FileSizeMiB*1MB
+  $file=[IO.FileStream]::new((Join-Path $WorkRoot 'public.bin'),[IO.FileMode]::Create,[IO.FileAccess]::Write,[IO.FileShare]::None,1MB,[IO.FileOptions]::SequentialScan)
+  try{for($written=0L;$written -lt $length;$written+=$block.Length){$file.Write($block,0,[int][Math]::Min($block.Length,$length-$written))}}finally{$file.Dispose()}
+  Copy-Item -LiteralPath (Join-Path $WorkRoot 'public.bin') -Destination (Join-Path $WorkRoot 'secret-name.bin')
+  Copy-Item -LiteralPath (Join-Path $WorkRoot 'public.bin') -Destination (Join-Path $WorkRoot 'content.bin')
+  $file=[IO.File]::Open((Join-Path $WorkRoot 'content.bin'),[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::None)
+  try{$file.Position=$length-65536-3;$marker=[Text.Encoding]::ASCII.GetBytes('SeCrEt');$file.Write($marker,0,$marker.Length)}finally{$file.Dispose()}
+  Copy-Item -LiteralPath (Join-Path $WorkRoot 'content.bin') -Destination (Join-Path $WorkRoot 'banner-content.bin')
+  $file=[IO.File]::Open((Join-Path $WorkRoot 'banner-content.bin'),[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::None)
+  try{$header=[Text.Encoding]::ASCII.GetBytes('220 Public-looking data header');$file.Write($header,0,$header.Length)}finally{$file.Dispose()}
+ }else{
+  [IO.File]::WriteAllBytes((Join-Path $WorkRoot 'public.bin'),[Text.Encoding]::UTF8.GetBytes(('Public business transfer data. '+[Environment]::NewLine)*4096))
+  Copy-Item -LiteralPath (Join-Path $WorkRoot 'public.bin') -Destination (Join-Path $WorkRoot 'secret-name.bin')
+  [IO.File]::WriteAllBytes((Join-Path $WorkRoot 'content.bin'),[Text.Encoding]::UTF8.GetBytes(('A'*65533)+'SeCrEt'+('Z'*65536)))
+  [IO.File]::WriteAllBytes((Join-Path $WorkRoot 'banner-content.bin'),[Text.Encoding]::UTF8.GetBytes('220 Public-looking data header'+"`r`n"+('A'*65533)+'SeCrEt'))
+ }
  foreach($case in $cases){
   $result=Invoke-Case $case
   $results.Add($result)
@@ -262,7 +307,7 @@ try{
 }catch{$caseState.Stage='failed';$caseState.Error=Sanitize $_.Exception.Message}
 finally{
  Save-State
- $summary=[ordered]@{Hostname=$env:COMPUTERNAME;CompletedUtc=[DateTime]::UtcNow.ToString('o');Configuration=$Configuration;Completed=$caseState.Completed;Passed=$caseState.Passed;Failed=$caseState.Failed;Error=$caseState.Error;DriverSHA256=(Get-FileHash -LiteralPath $driver).Hash;ConsoleSHA256=(Get-FileHash -LiteralPath $guard).Hash;TlsCertificatePolicy='Explicit FTPS requires the configured lab CA; no insecure certificate bypass';TlsDecryptedByWfp=$false;Cases=$results.ToArray()}
+ $summary=[ordered]@{Hostname=$env:COMPUTERNAME;CompletedUtc=[DateTime]::UtcNow.ToString('o');Configuration=$Configuration;FileSizeMiB=$FileSizeMiB;ClientTimeLimitSeconds=$ClientTimeoutSeconds;Completed=$caseState.Completed;Passed=$caseState.Passed;Failed=$caseState.Failed;Error=$caseState.Error;DriverSHA256=(Get-FileHash -LiteralPath $driver).Hash;ConsoleSHA256=(Get-FileHash -LiteralPath $guard).Hash;CurlVersion=$curlVersion;CurlSHA256=(Get-FileHash -LiteralPath $curl).Hash;TlsCertificatePolicy='Explicit FTPS requires the configured lab CA; no insecure certificate bypass';TlsDecryptedByWfp=$false;Cases=$results.ToArray()}
  $json=$summary|ConvertTo-Json -Depth 7
  if($json.Contains($password) -or $json -match '(?i)\.(?:ps1|psm1|bat|cmd|py)\b'){throw 'Results sanitization failed'}
  [IO.File]::WriteAllText((Join-Path $ResultRoot 'summary.json'),$json,$utf8)

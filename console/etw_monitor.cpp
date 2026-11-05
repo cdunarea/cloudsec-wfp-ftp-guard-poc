@@ -43,6 +43,7 @@ bool EtwMonitor::StartSession(Session& session, bool kernel) {
     properties->MaximumBuffers = 32;
     properties->FlushTimer = 1;
     properties->LogFileMode = EVENT_TRACE_REAL_TIME_MODE | (kernel ? EVENT_TRACE_SYSTEM_LOGGER_MODE : 0);
+    if (kernel && file_history_) { properties->LogFileMode |= EVENT_TRACE_NO_PER_PROCESSOR_BUFFERING; }
     properties->EnableFlags = kernel ? EVENT_TRACE_FLAG_NETWORK_TCPIP : 0;
     if (kernel && file_history_) {
         properties->EnableFlags |= EVENT_TRACE_FLAG_DISK_FILE_IO | EVENT_TRACE_FLAG_FILE_IO | EVENT_TRACE_FLAG_FILE_IO_INIT;
@@ -141,6 +142,7 @@ void EtwMonitor::FileRecord(EVENT_RECORD* record) {
     const auto opcode = record->EventHeader.EventDescriptor.Opcode;
     if (opcode != 64 && opcode != 66 && opcode != 67) { return; }
     const auto pid = record->EventHeader.ProcessId;
+    if (pid == GetCurrentProcessId()) { return; } // Scanning must not create its own evidence/decoder backlog.
     const auto object = PointerNumber(record, L"FileObject");
     const auto at = record->EventHeader.TimeStamp.QuadPart;
     if (at <= 0) { return; }
@@ -196,7 +198,8 @@ NetFileEvidence EtwMonitor::RecentFiles(const NetEvent& event) {
         delivered = session.progress.Wait(target, std::chrono::milliseconds(3000));
     }
     Diagnostics::Line("[ETW SYNC] flushed_buffers=" + std::to_string(target) +
-        " delivered_buffers=" + std::to_string(session.progress.Buffers()) + " elapsed_ms=" + std::to_string(GetTickCount64() - started));
+        " delivered_buffers=" + std::to_string(session.progress.Buffers()) + " elapsed_ms=" + std::to_string(GetTickCount64() - started) +
+        " callbacks=" + std::to_string(session.callbacks.load()));
     if (!delivered) { return {{}, false, "ETW file evidence delivery timed out or consumer stopped"}; }
     std::lock_guard lock(mutex_);
     const auto since = event.file_since != 0 ? event.file_since : event.captured_at;
@@ -216,7 +219,13 @@ void WINAPI EtwMonitor::Callback(EVENT_RECORD* record) {
 }
 ULONG WINAPI EtwMonitor::BufferCallback(EVENT_TRACE_LOGFILEW* logfile) {
     auto* session = static_cast<Session*>(logfile->Context);
-    if (session != nullptr) { session->progress.Advance(logfile->BuffersRead); }
+    if (session != nullptr) {
+        const auto callbacks = ++session->callbacks;
+        if (callbacks <= 3) {
+            Diagnostics::Line("[ETW BUFFER] buffers_read=" + std::to_string(logfile->BuffersRead) + " callbacks=" + std::to_string(callbacks));
+        }
+        session->progress.Advance(logfile->BuffersRead);
+    }
     return TRUE;
 }
 

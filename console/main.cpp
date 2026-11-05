@@ -58,6 +58,7 @@ class Console {
         bool help = false;
     };
     inline static std::atomic<bool> stopping_{false};
+    inline static guard::FileScanner scanner_;
     static BOOL WINAPI Ctrl(DWORD kind) {
         if (kind == CTRL_C_EVENT || kind == CTRL_BREAK_EVENT || kind == CTRL_CLOSE_EVENT || kind == CTRL_SHUTDOWN_EVENT) { stopping_.store(true); return TRUE; }
         return FALSE;
@@ -137,7 +138,8 @@ class Console {
             ((event.flags & guard::NetAmbiguous) != 0 ? " ambiguous=yes" : "") +
             ((event.flags & guard::NetExplicitTls) != 0 ? " control-upgrade=requested data-protection=unavailable decrypted=no" : ""));
         const auto recent = etw.RecentFiles(event);
-        auto result = guard::FileScanner().Scan(static_cast<DWORD>(event.process_id), event.process_created, 8000, recent.paths, true);
+        auto result = scanner_.Scan(static_cast<DWORD>(event.process_id), event.process_created, 8000, recent.paths, true,
+            (event.flags & guard::NetData) != 0 ? event.flow : 0);
         if (!recent.complete && result.verdict == guard::ScanVerdict::Clear) {
             result.verdict = guard::ScanVerdict::Incomplete;
             result.detail = recent.detail;
@@ -162,6 +164,7 @@ class Console {
             " pid=" + std::to_string(event.process_id) + " rule=" + rule + " file=\"" + guard::Diagnostics::Utf8(result.path) +
             "\" open_file_handles=" + std::to_string(result.handles) + " scanned_files=" + std::to_string(result.files) +
             " scanned_bytes=" + std::to_string(result.bytes) + " recent_files=" + std::to_string(result.recent_files) +
+            " cached_files=" + std::to_string(result.cached_files) +
             " file_evidence=" + ((event.flags & guard::NetData) != 0 ? "observed-file-read" : "observed-file-open") + " detail=" + result.detail +
             (verified ? " verdict_scope=data-flow" : " verdict_scope=indication") +
             (accepted ? " decision=accepted" : " decision=stale-or-failed error=" + std::to_string(GetLastError())));

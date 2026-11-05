@@ -25,7 +25,10 @@ class Tests {
         FileReads();
         TraceProgress();
         Matchers();
+        MatcherWindows();
+        GuardedMatcherPages();
         Files();
+        SourceCache();
         std::cout << "Assertions=" << checks_ << " failures=" << failures_ << '\n';
         return failures_ == 0 ? 0 : 1;
     }
@@ -187,6 +190,7 @@ class Tests {
         cache.Record(7, now - 20, L"closed-before-connect.txt");
         cache.Record(7, now - 5, L"current.txt");
         cache.Record(7, now - 4, L"current.txt");
+        cache.Record(7, now - 5, L"current.txt"); // Late delivery must not move the latest observation backwards.
         cache.Record(8, now - 3, L"other-process.txt");
         cache.Record(7, now + 1, L"future.txt");
         const auto paths = cache.Paths(7, now - 10, now);
@@ -219,9 +223,14 @@ class Tests {
         for (std::uint64_t i = 1; i <= 4097; ++i) { cache.Open(9, i + 10, now, std::to_wstring(i)); }
         cache.Read(9, 11, now + 1);
         Check(cache.Evictions() != 0 && cache.Paths(9, now, now + 1).empty(), "object map eviction is bounded and observable");
-        for (std::uint64_t i = 0; i < 1100; ++i) { cache.Read(9, 4107, now + 10 + i); }
+        for (std::uint64_t i = 0; i < 1100; ++i) { cache.Read(9, 11 + i, now + 10 + i); }
         Check(cache.Evictions() > 1, "read history eviction is observable independently of object-map capacity");
         Check(cache.Paths(9, now, now + 40ULL * 10000000).empty(), "read evidence expires after thirty seconds");
+        guard::NetFileReadCache bulk;
+        bulk.Open(7, 1, now, L"large-source.bin");
+        for (std::uint64_t i = 0; i < 20000; ++i) { bulk.Read(7, 1, now + i); }
+        Check(bulk.Evictions() == 0 && bulk.Paths(7, now, now + 20000).size() == 1,
+              "bulk reads coalesce evidence instead of poisoning the bounded history");
     }
     static void TraceProgress() {
         using namespace std::chrono_literals;
@@ -267,11 +276,157 @@ class Tests {
             guard::SecretMatcher matcher;
             for (char c : value) { const auto byte = static_cast<unsigned char>(c); matcher.Feed(&byte, 1); }
             Check(matcher.Found() == Contains(value), "randomized matcher differential check");
+            guard::SecretMatcher chunked;
+            size_t at = 0;
+            while (at < value.size()) {
+                const size_t count = (std::min)(value.size() - at, static_cast<size_t>(1 + random() % 63));
+                chunked.Feed(reinterpret_cast<const unsigned char*>(value.data() + at), count); at += count;
+            }
+            Check(chunked.Found() == Contains(value), "vector-search matcher agrees across random chunk boundaries");
+        }
+        for (const std::string repeated : {std::string("xxSx"), std::string("SecreX"), std::string("S\0S\0", 4)}) {
+            std::string dense;
+            while (dense.size() < 256 * 1024) { dense += repeated; }
+            guard::SecretMatcher clear;
+            Check(!clear.Feed(reinterpret_cast<const unsigned char*>(dense.data()), dense.size()),
+                  "dense starts and near-matches remain public without repeated suffix searches");
+            for (const std::string marker : {std::string("SeCrEt"), std::string("S\0e\0C\0r\0E\0t\0", 12), std::string("\0S\0e\0C\0r\0E\0t", 12)}) {
+                const auto value = dense + marker + std::string(64, 'P');
+                guard::SecretMatcher found;
+                Check(found.Feed(reinterpret_cast<const unsigned char*>(value.data()), value.size()),
+                      "vector windows qualify complete ASCII and both UTF16 encodings after dense public prefixes");
+            }
+        }
+        for (const auto& pattern : {std::string("SeCrEt"), std::string("s\0e\0c\0r\0e\0t\0",12), std::string("\0s\0e\0c\0r\0e\0t",12)}) {
+            const std::string value = std::string(1024 * 1024, 'P') + pattern;
+            for (size_t cut = value.size() - pattern.size(); cut <= value.size(); ++cut) {
+                guard::SecretMatcher matcher;
+                matcher.Feed(reinterpret_cast<const unsigned char*>(value.data()), cut);
+                Check(matcher.Feed(reinterpret_cast<const unsigned char*>(value.data() + cut), value.size() - cut),
+                      "fast skipping preserves late ASCII/UTF16 markers at every split");
+            }
+        }
+    }
+    static void MatcherWindows() {
+        const std::vector<std::string> markers{"SeCrEt", std::string("S\0e\0C\0r\0E\0t\0", 12), std::string("\0S\0e\0C\0r\0E\0t", 12)};
+        for (const auto& marker : markers) {
+            for (size_t alignment = 0; alignment < 32; ++alignment) {
+                const std::string value = std::string(40 + alignment, 'P') + marker + std::string(40, 'P');
+                for (size_t cut = 0; cut <= value.size(); ++cut) {
+                    guard::SecretMatcher matcher;
+                    matcher.Feed(reinterpret_cast<const unsigned char*>(value.data()), cut);
+                    Check(matcher.Feed(reinterpret_cast<const unsigned char*>(value.data() + cut), value.size() - cut) == Contains(value),
+                          "vector windows retain every encoding, alignment and input split");
+                }
+            }
+        }
+    }
+    static void GuardedMatcherPages() {
+        SYSTEM_INFO system{};
+        GetSystemInfo(&system);
+        struct NetGuardedRegion {
+            void* data = nullptr;
+            ~NetGuardedRegion() { if (data != nullptr) { VirtualFree(data, 0, MEM_RELEASE); } }
+        } region;
+        region.data = VirtualAlloc(nullptr, static_cast<size_t>(system.dwPageSize) * 2, MEM_RESERVE, PAGE_NOACCESS);
+        if (region.data == nullptr || VirtualAlloc(region.data, system.dwPageSize, MEM_COMMIT, PAGE_READWRITE) == nullptr) {
+            throw std::runtime_error("guarded matcher allocation");
+        }
+        const std::string marker("\0S\0e\0C\0r\0E\0t", 12);
+        for (size_t length = 0; length <= 96; ++length) {
+            const auto value = length < marker.size() ? std::string(length, 'P') : std::string(length - marker.size(), 'P') + marker;
+            auto* bytes = static_cast<unsigned char*>(region.data) + system.dwPageSize - length;
+            std::copy(value.begin(), value.end(), bytes);
+            guard::SecretMatcher matcher;
+            Check(matcher.Feed(bytes, length) == Contains(value), "vector lookahead stays within the supplied buffer before a protected page");
         }
     }
     static void Write(HANDLE handle, const std::string& bytes) {
         DWORD written = 0;
         if (!WriteFile(handle, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) || written != bytes.size()) { throw std::runtime_error("unit WriteFile"); }
+    }
+    static void SourceCache() {
+        const auto path = std::filesystem::temp_directory_path() / (L"WfpFtpGuard-cache-" + std::to_wstring(GetCurrentProcessId()) + L".bin");
+        const auto extra = std::filesystem::path(path.wstring() + L".other");
+        struct Cleanup {
+            std::filesystem::path path, extra;
+            ~Cleanup() { std::error_code error; std::filesystem::remove(path, error); std::filesystem::remove(extra, error); }
+        } cleanup{path, extra};
+        const auto replace = [&](const std::filesystem::path& target, const std::string& content) {
+            guard::WinHandle file(CreateFileW(target.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr, CREATE_ALWAYS, 0, nullptr));
+            if (!file.Valid()) { throw std::runtime_error("cache fixture"); }
+            Write(file.Get(), content);
+        };
+        FILETIME created{}, exited{}, kernel{}, user{};
+        if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) { throw std::runtime_error("cache identity"); }
+        const auto birth = (static_cast<std::uint64_t>(created.dwHighDateTime) << 32) | created.dwLowDateTime;
+        ULONGLONG cache_now = 100000;
+        guard::FileScanner scanner([&] { return cache_now; });
+        const auto scan = [&](std::uint64_t flow, const std::vector<std::wstring>& paths) {
+            return scanner.Scan(GetCurrentProcessId(), birth, 8000, paths, true, flow);
+        };
+        replace(path, "public");
+        const auto first = scan(70, {path.wstring()});
+        Check(first.verdict == guard::ScanVerdict::Clear && first.bytes == 6 && first.cached_files == 0, "new source receives a complete content scan");
+        const auto hit = scan(70, {path.wstring()});
+        Check(hit.verdict == guard::ScanVerdict::Clear && hit.bytes == 0 && hit.cached_files == 1, "unchanged same-flow source reuses a checked verdict");
+        cache_now += 30001;
+        Check(scan(70, {path.wstring()}).cached_files == 0, "expired file verdicts are rescanned without a fixed-delay test");
+        Check(scan(71, {path.wstring()}).cached_files == 0, "content cache is scoped to a data flow");
+        Check(scanner.Scan(GetCurrentProcessId(), birth, 0, {path.wstring()}, true, 70).verdict == guard::ScanVerdict::Incomplete,
+              "a cached verdict cannot bypass the inspection deadline");
+        replace(extra, "public");
+        const auto latest = scan(70, {path.wstring(), extra.wstring()});
+        Check(latest.verdict == guard::ScanVerdict::Clear && latest.path.find(extra.filename().wstring()) != std::wstring::npos,
+              "allow diagnostics identify the most recent inspected source rather than an earlier certificate");
+        const auto cached_latest = scan(70, {path.wstring(), extra.wstring()});
+        Check(cached_latest.cached_files == 2 && cached_latest.path.find(extra.filename().wstring()) != std::wstring::npos,
+              "cached source diagnostics retain the latest candidate path");
+        replace(extra, "secret");
+        const auto new_source = scan(70, {path.wstring(), extra.wstring()});
+        Check(new_source.verdict == guard::ScanVerdict::SecretContent && new_source.cached_files == 1,
+              "a cached public certificate/source cannot authorize a newly observed secret source");
+        replace(path, "secret");
+        Check(scan(70, {path.wstring()}).verdict == guard::ScanVerdict::SecretContent, "same-size source modification invalidates the cached verdict");
+        replace(path, "public");
+        scan(72, {path.wstring()});
+        {
+            guard::WinHandle writer(CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr, OPEN_EXISTING, 0, nullptr));
+            if (!writer.Valid()) { throw std::runtime_error("cache writer"); }
+            Write(writer.Get(), "secret");
+            const auto result = scan(72, {path.wstring()});
+            Check(result.verdict == guard::ScanVerdict::SecretContent && result.cached_files == 0, "an outstanding writer prevents cached approval");
+        }
+        std::filesystem::remove(path);
+        replace(path, "secret");
+        Check(scan(70, {path.wstring()}).verdict == guard::ScanVerdict::SecretContent, "replacement at the same path is not a cached file identity");
+        Check(scanner.Scan(GetCurrentProcessId(), 1, 8000, {path.wstring()}, true, 70).verdict == guard::ScanVerdict::Incomplete,
+              "cache reuse never bypasses process-instance verification");
+        replace(path, "public");
+        for (std::uint64_t flow = 1000; flow <= 1064; ++flow) { scan(flow, {path.wstring()}); }
+        Check(scan(1000, {path.wstring()}).cached_files == 0, "the bounded content cache evicts old grants conservatively");
+        guard::FileScanner real_clock;
+        real_clock.Scan(GetCurrentProcessId(), birth, 8000, {path.wstring()}, true, 9000);
+        Check(real_clock.Scan(GetCurrentProcessId(), birth, 8000, {path.wstring()}, true, 9000).cached_files == 1,
+              "normal cache timing uses the monotonic system clock");
+        FILE_BASIC_INFO original{};
+        {
+            guard::WinHandle file(CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr, OPEN_EXISTING, 0, nullptr));
+            if (!GetFileInformationByHandleEx(file.Get(), FileBasicInfo, &original, sizeof(original))) { throw std::runtime_error("cache original times"); }
+        }
+        scan(1100, {path.wstring()});
+        replace(path, "secret");
+        {
+            guard::WinHandle file(CreateFileW(path.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr, OPEN_EXISTING, 0, nullptr));
+            if (!SetFileInformationByHandle(file.Get(), FileBasicInfo, &original, sizeof(original))) { throw std::runtime_error("cache restored times"); }
+        }
+        const auto restored = scan(1100, {path.wstring()});
+        Check(restored.verdict == guard::ScanVerdict::SecretContent && restored.cached_files == 0,
+              "NTFS change-journal identity invalidates modified content even when timestamps are restored");
     }
     static void Files() {
         const auto root = std::filesystem::temp_directory_path() / (L"WfpFtpGuard-unit-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));

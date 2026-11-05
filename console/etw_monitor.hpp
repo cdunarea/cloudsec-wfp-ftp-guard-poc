@@ -34,6 +34,7 @@ class EtwMonitor {
     struct Session {
         EtwMonitor* owner = nullptr;
         NetTraceProgress progress;
+        std::atomic<UINT64> callbacks{0};
         std::wstring name;
         std::vector<unsigned char> properties;
         TRACEHANDLE controller = 0;

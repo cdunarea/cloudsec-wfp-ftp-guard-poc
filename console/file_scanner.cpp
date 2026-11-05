@@ -1,8 +1,10 @@
 #include "file_scanner.hpp"
 #include <winternl.h>
+#include <winioctl.h>
 #include <algorithm>
 #include <array>
 #include <cwctype>
+#include <cstring>
 #include <filesystem>
 #include <limits>
 #include "secret_matcher.hpp"
@@ -130,7 +132,53 @@ ScanResult FileScanner::InspectFile(HANDLE file, DWORD budget_ms) const {
     return result;
 }
 
-void FileScanner::InspectRecent(const std::wstring& path, ULONGLONG deadline, ScanResult& result) {
+bool FileScanner::Stamp(HANDLE file, NetFileStamp& stamp) {
+    return GetFileInformationByHandleEx(file, FileIdInfo, &stamp.identity, sizeof(stamp.identity)) &&
+           GetFileInformationByHandleEx(file, FileBasicInfo, &stamp.basic, sizeof(stamp.basic)) &&
+           GetFileInformationByHandleEx(file, FileStandardInfo, &stamp.standard, sizeof(stamp.standard)) &&
+           !stamp.standard.Directory && FileUsn(file, stamp.usn);
+}
+bool FileScanner::FileUsn(HANDLE file, LONGLONG& usn) {
+    alignas(USN_RECORD_V2) std::array<unsigned char, 1024> bytes{};
+    DWORD count = 0;
+    if (!DeviceIoControl(file, FSCTL_READ_FILE_USN_DATA, nullptr, 0, bytes.data(), static_cast<DWORD>(bytes.size()), &count, nullptr) ||
+        count < offsetof(USN_RECORD_V2, FileName)) { return false; }
+    const auto* record = reinterpret_cast<const USN_RECORD_V2*>(bytes.data());
+    if (record->MajorVersion != 2 || record->RecordLength > count || record->Usn == 0) { return false; }
+    usn = record->Usn;
+    return true;
+}
+bool FileScanner::SameStamp(const NetFileStamp& left, const NetFileStamp& right) {
+    return left.identity.VolumeSerialNumber == right.identity.VolumeSerialNumber &&
+        std::memcmp(&left.identity.FileId, &right.identity.FileId, sizeof(left.identity.FileId)) == 0 &&
+        left.standard.EndOfFile.QuadPart == right.standard.EndOfFile.QuadPart &&
+        left.basic.LastWriteTime.QuadPart == right.basic.LastWriteTime.QuadPart &&
+        left.basic.ChangeTime.QuadPart == right.basic.ChangeTime.QuadPart && left.usn == right.usn;
+}
+bool FileScanner::Cached(HANDLE file, const std::wstring& path, const NetScanContext& context, ScanResult& result) const {
+    NetFileStamp stamp;
+    if (context.flow == 0 || SecretFilename(path) || !Stamp(file, stamp)) { return false; }
+    const auto now = CacheTime();
+    const auto match = std::find_if(source_cache_.begin(), source_cache_.end(), [&](const auto& entry) {
+        return entry.process_id == context.process_id && entry.process_created == context.process_created &&
+            entry.flow == context.flow && entry.path == path && now - entry.scanned_at <= 30000 && SameStamp(entry.stamp, stamp);
+    });
+    if (match == source_cache_.end()) { return false; }
+    ++result.files; ++result.cached_files;
+    if (result.verdict == ScanVerdict::Clear) { result.path = path; }
+    return true;
+}
+void FileScanner::Remember(HANDLE file, const std::wstring& path, const NetFileStamp& before, const NetScanContext& context) const {
+    NetFileStamp after;
+    if (context.flow == 0 || !Stamp(file, after) || !SameStamp(before, after)) { return; }
+    const auto now = CacheTime();
+    std::erase_if(source_cache_, [&](const auto& entry) {
+        return now - entry.scanned_at > 30000 || (entry.process_id == context.process_id && entry.flow == context.flow && entry.path == path);
+    });
+    if (source_cache_.size() >= 64) { source_cache_.erase(source_cache_.begin()); }
+    source_cache_.push_back({context.process_id, context.process_created, context.flow, path, after, now});
+}
+void FileScanner::InspectRecent(const std::wstring& path, ULONGLONG deadline, ScanResult& result, const NetScanContext& context) const {
     std::wstring open = path;
     if (path.rfind(L"\\Device\\HarddiskVolume", 0) == 0) { open = L"\\\\?\\GLOBALROOT" + path; }
     else if (path.size() < 3 || path[1] != L':') { return; }
@@ -139,13 +187,26 @@ void FileScanner::InspectRecent(const std::wstring& path, ULONGLONG deadline, Sc
                                nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
     if (!file.Valid()) { Incomplete(result, "Open recent file", GetLastError()); return; }
     ++result.recent_files;
-    Inspect(file.Get(), deadline, result);
-    if (result.verdict == ScanVerdict::Clear && result.path.empty() && result.files != 0) { result.path = FilePath(file.Get()); }
+    // The temporary sharing lease excludes writers/replacement while checking a
+    // cached file identity/change stamp. Incompatible sources use a full scan.
+    WinHandle stable(context.flow == 0 ? INVALID_HANDLE_VALUE : CreateFileW(open.c_str(), GENERIC_READ, FILE_SHARE_READ,
+        nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+    NetFileStamp before;
+    const auto name = stable.Valid() ? FilePath(stable.Get()) : std::wstring{};
+    if (!name.empty() && Cached(stable.Get(), name, context, result)) { return; }
+    const bool cacheable = stable.Valid() && !name.empty() && Stamp(stable.Get(), before);
+    const auto initial_files = result.files;
+    // Scan the same object whose identity will be cached. The path may have
+    // been replaced between the two opens; the first handle can name an old file.
+    const HANDLE inspected = stable.Valid() ? stable.Get() : file.Get();
+    Inspect(inspected, deadline, result);
+    if (cacheable && result.verdict == ScanVerdict::Clear && result.files > initial_files) { Remember(stable.Get(), name, before, context); }
+    if (result.verdict == ScanVerdict::Clear && result.files > initial_files) { result.path = FilePath(inspected); }
     if (result.verdict == ScanVerdict::SecretName || result.verdict == ScanVerdict::SecretContent) { result.recent_match = true; }
 }
 
 ScanResult FileScanner::Scan(DWORD process_id, std::uint64_t process_created, DWORD budget_ms,
-                            const std::vector<std::wstring>& recent_files, bool source_paths_only) const {
+                            const std::vector<std::wstring>& recent_files, bool source_paths_only, std::uint64_t flow_id) const {
     ScanResult result;
     WinHandle process(OpenProcess(PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id));
     if (!process.Valid()) { Incomplete(result, "OpenProcess", GetLastError()); return result; }
@@ -154,7 +215,7 @@ ScanResult FileScanner::Scan(DWORD process_id, std::uint64_t process_created, DW
         return result;
     }
     if (source_paths_only) {
-        InspectPaths(recent_files, GetTickCount64() + budget_ms, result);
+        InspectPaths(recent_files, GetTickCount64() + budget_ms, result, {process_id, process_created, flow_id});
         return result;
     }
     std::array<wchar_t, 32768> executable{};
@@ -191,12 +252,12 @@ ScanResult FileScanner::Scan(DWORD process_id, std::uint64_t process_created, DW
         if (result.verdict == ScanVerdict::SecretName || result.verdict == ScanVerdict::SecretContent) { break; }
     }
     if (result.verdict == ScanVerdict::SecretName || result.verdict == ScanVerdict::SecretContent) { return result; }
-    InspectPaths(recent_files, deadline, result);
+    InspectPaths(recent_files, deadline, result, {process_id, process_created, 0});
     return result;
 }
-void FileScanner::InspectPaths(const std::vector<std::wstring>& paths, ULONGLONG deadline, ScanResult& result) {
+void FileScanner::InspectPaths(const std::vector<std::wstring>& paths, ULONGLONG deadline, ScanResult& result, const NetScanContext& context) const {
     for (const auto& path : paths) {
-        InspectRecent(path, deadline, result);
+        InspectRecent(path, deadline, result, context);
         if (result.verdict == ScanVerdict::SecretName || result.verdict == ScanVerdict::SecretContent) { return; }
     }
 }
