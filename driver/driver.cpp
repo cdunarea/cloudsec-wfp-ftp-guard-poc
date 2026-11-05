@@ -9,6 +9,7 @@
 #include "ids.hpp"
 #include "protocol.hpp"
 #include "ftp_probe.hpp"
+#include "ftp_transfer.hpp"
 
 extern "C" DRIVER_INITIALIZE DriverEntry;
 
@@ -40,7 +41,12 @@ struct Flow {
     UINT16 layer;
     guard::NetEvent event;
     guard::FtpProbe probe;
-    guard::FtpUploadProbe uploads;
+    guard::NetFtpTransferProbe transfers;
+    guard::NetTransferVerb transfer;
+    BOOLEAN server;
+    BOOLEAN explicit_tls;
+    BOOLEAN data_flow;
+    BOOLEAN source_verified;
     Verdict verdict;
     UINT64 waiting_since;
     UINT64 probe_since;
@@ -154,14 +160,12 @@ class Driver {
     }
     static void NTAPI FlowClassify(const FWPS_INCOMING_VALUES0* values, const FWPS_INCOMING_METADATA_VALUES0* metadata,
                                    void*, const FWPS_FILTER0*, UINT64, FWPS_CLASSIFY_OUT0* result) {
-        if ((result->rights & FWPS_RIGHT_ACTION_WRITE) == 0) { return; }
-        result->actionType = FWP_ACTION_CONTINUE;
+        if ((result->rights & FWPS_RIGHT_ACTION_WRITE) != 0) { result->actionType = FWP_ACTION_CONTINUE; }
         if (InterlockedCompareExchange(&state.stopping, 0, 0) != 0 ||
             !FWPS_IS_METADATA_FIELD_PRESENT(metadata, FWPS_METADATA_FIELD_FLOW_HANDLE) ||
             !FWPS_IS_METADATA_FIELD_PRESENT(metadata, FWPS_METADATA_FIELD_PROCESS_ID)) { return; }
         const bool ipv6 = values->layerId == FWPS_LAYER_ALE_FLOW_ESTABLISHED_V6;
         const UINT direction = ipv6 ? FWPS_FIELD_ALE_FLOW_ESTABLISHED_V6_DIRECTION : FWPS_FIELD_ALE_FLOW_ESTABLISHED_V4_DIRECTION;
-        if (values->incomingValue[direction].value.uint32 != FWP_DIRECTION_OUTBOUND) { return; }
         auto* flow = static_cast<Flow*>(ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(Flow), kTag));
         if (flow == nullptr) { return; }
         InitializeListHead(&flow->sending);
@@ -173,13 +177,17 @@ class Driver {
         flow->callout = state.callouts[ipv6 ? 3 : 2];
         flow->layer = static_cast<UINT16>(ipv6 ? FWPS_LAYER_STREAM_V6 : FWPS_LAYER_STREAM_V4);
         flow->probe.Reset();
-        flow->uploads.Reset();
+        flow->transfers.Reset();
+        flow->transfer = guard::NetTransferVerb::None;
+        flow->server = values->incomingValue[direction].value.uint32 == FWP_DIRECTION_INBOUND;
         flow->event.version = guard::kVersion;
         flow->event.flow = flow->id;
         flow->event.process_id = metadata->processId;
+        flow->event.flags = flow->server ? guard::NetServer | guard::NetInbound : 0;
         LARGE_INTEGER captured;
         KeQuerySystemTimePrecise(&captured);
         flow->event.captured_at = static_cast<UINT64>(captured.QuadPart);
+        flow->event.file_since = flow->event.captured_at;
         FillEndpoint(flow->event, values, ipv6);
         KIRQL irql;
         KeAcquireSpinLock(&state.flows_lock, &irql);
@@ -229,21 +237,83 @@ class Driver {
         flow->event.evidence[i] = '\0';
     }
     static void InspectProtocol(Flow* flow, bool sending, const UCHAR* prefix, SIZE_T copied, UINT32 flags) {
-        const bool upload = sending && (flow->verdict == Verdict::Unknown || flow->ftp_confirmed) &&
-            flow->uploads.Feed(prefix, copied);
+        const bool client_command = sending != (flow->server != FALSE);
+        const bool changed = client_command && flow->transfers.Feed(prefix, copied);
+        flow->transfer = flow->transfers.Transfer();
+        if (flow->transfers.TlsRequested()) {
+            flow->explicit_tls = TRUE;
+            flow->event.flags |= guard::NetExplicitTls;
+        }
         if (flow->verdict == Verdict::Unknown) {
-            const auto protocol = flow->probe.Feed(sending, prefix, copied);
+            const auto protocol = flow->probe.Feed(client_command, prefix, copied);
             if (protocol == guard::ProtocolVerdict::Other) { flow->verdict = Verdict::Allow; }
             if (protocol == guard::ProtocolVerdict::Ftp) {
                 flow->ftp_confirmed = TRUE;
-                RequestInspection(flow, flow->probe.Verb());
+                flow->verdict = Verdict::Allow;
+                QueueEvent(flow, guard::NetEventKind::FtpControl, 0, flow->probe.Verb());
             }
             if (flow->verdict == Verdict::Unknown && (flags & FWPS_STREAM_FLAG_SEND_DISCONNECT) != 0) {
                 flow->verdict = Verdict::Allow;
             }
-        } else if (flow->verdict == Verdict::Allow && flow->ftp_confirmed && upload) {
-            RequestInspection(flow, flow->uploads.Verb());
         }
+        if (changed && flow->ftp_confirmed) {
+            QueueEvent(flow, guard::NetEventKind::Transfer, 0, flow->transfers.Verb());
+            // Client uploads may already have an open/briefly opened source.
+            // Server RETR must reach the server first so it can open that source.
+            if (!flow->server && flow->transfer == guard::NetTransferVerb::Upload &&
+                !flow->explicit_tls && flow->verdict == Verdict::Allow) {
+                RequestInspection(flow, flow->transfers.Verb());
+            }
+        }
+    }
+    static bool SamePeer(const Flow* left, const Flow* right) {
+        const auto& a = left->event;
+        const auto& b = right->event;
+        return a.process_id == b.process_id && a.family == b.family &&
+            RtlCompareMemory(a.remote_address, b.remote_address, a.family == AF_INET6 ? 16 : 4) ==
+                static_cast<SIZE_T>(a.family == AF_INET6 ? 16 : 4);
+    }
+    static void AssociateData(Flow* flow, bool greeting) {
+        // PoC correlation, not decrypted FTP negotiation: same owning process
+        // and peer as a live recognized control flow. Ambiguity is reported.
+        Flow* parent = nullptr;
+        ULONG matches = 0;
+        KIRQL irql;
+        KeAcquireSpinLock(&state.flows_lock, &irql);
+        for (auto* entry = state.flows.Flink; entry != &state.flows; entry = entry->Flink) {
+            auto* candidate = CONTAINING_RECORD(entry, Flow, link);
+            if (candidate == flow || !SamePeer(candidate, flow)) { continue; }
+            KeAcquireSpinLockAtDpcLevel(&candidate->lock);
+            const bool match = candidate->ftp_confirmed && !candidate->data_flow && !candidate->closing &&
+                candidate->verdict != Verdict::Closed && candidate->verdict != Verdict::Block &&
+                (candidate->server ? candidate->event.local_port != flow->event.local_port :
+                                     candidate->event.remote_port != flow->event.remote_port);
+            KeReleaseSpinLockFromDpcLevel(&candidate->lock);
+            if (match) { parent = candidate; ++matches; }
+        }
+        if (parent != nullptr) {
+            KeAcquireSpinLockAtDpcLevel(&parent->lock);
+            const BOOLEAN server = parent->server;
+            const BOOLEAN tls = parent->explicit_tls;
+            const auto transfer = parent->transfer;
+            const auto id = parent->id;
+            const auto since = parent->event.captured_at;
+            KeReleaseSpinLockFromDpcLevel(&parent->lock);
+            KeAcquireSpinLockAtDpcLevel(&flow->lock);
+            if (!flow->ftp_confirmed && !flow->probe.HasGreeting() &&
+                guard::NetTransferGate::DataCandidate(greeting, server != FALSE, tls != FALSE, transfer)) {
+                flow->data_flow = TRUE;
+                flow->server = server;
+                flow->explicit_tls = tls;
+                flow->transfer = transfer;
+                flow->event.flags = static_cast<USHORT>((flow->event.flags & guard::NetInbound) | guard::NetData |
+                    (server ? guard::NetServer : 0) | (tls ? guard::NetExplicitTls : 0) | (matches > 1 ? guard::NetAmbiguous : 0));
+                flow->event.control_flow = matches == 1 ? id : 0;
+                flow->event.file_since = since;
+            }
+            KeReleaseSpinLockFromDpcLevel(&flow->lock);
+        }
+        KeReleaseSpinLock(&state.flows_lock, irql);
     }
     static void NTAPI StreamClassify(const FWPS_INCOMING_VALUES0*, const FWPS_INCOMING_METADATA_VALUES0*,
                                      void* layer_data, const FWPS_FILTER0*, UINT64 context, FWPS_CLASSIFY_OUT0* result) {
@@ -270,14 +340,23 @@ class Driver {
         if (data->dataLength != 0) {
             FwpsCopyStreamDataToBuffer0(data, prefix, data->dataLength < sizeof(prefix) ? data->dataLength : sizeof(prefix), &copied);
         }
+        const bool sending = (data->flags & FWPS_STREAM_FLAG_SEND) != 0;
+        const bool greeting = copied >= 4 && prefix[0] == '2' && prefix[1] == '2' && prefix[2] == '0' &&
+            (prefix[3] == ' ' || prefix[3] == '-');
+        AssociateData(flow, greeting);
         KIRQL irql;
         KeAcquireSpinLock(&flow->lock, &irql);
         const bool reject = state.stopping != 0 || flow->verdict == Verdict::Closed || flow->verdict == Verdict::Block ||
                             segment->length > kMaxQueuedBytes - flow->queued;
         if (!reject) {
-            const bool sending = (data->flags & FWPS_STREAM_FLAG_SEND) != 0;
             if (sending && flow->probe_since == 0) { flow->probe_since = Now(); }
-            InspectProtocol(flow, sending, prefix, copied, data->flags);
+            if (flow->data_flow) {
+                if (flow->verdict == Verdict::Unknown) { flow->verdict = Verdict::Allow; }
+                if (sending && flow->verdict == Verdict::Allow && !flow->source_verified &&
+                    guard::NetTransferGate::InspectData(flow->server != FALSE, flow->explicit_tls != FALSE, flow->transfer, segment->length)) {
+                    RequestInspection(flow, guard::NetTransferGate::Evidence(flow->server != FALSE, flow->explicit_tls != FALSE));
+                }
+            } else { InspectProtocol(flow, sending, prefix, copied, data->flags); }
             InsertTailList(sending ? &flow->sending : &flow->receiving, &segment->link);
             flow->queued += segment->length;
         }
@@ -358,13 +437,17 @@ class Driver {
         ObDereferenceObject(process);
         return exited;
     }
+    static bool TransportClosed(NTSTATUS status) {
+        return status == STATUS_CONNECTION_RESET || status == STATUS_CONNECTION_DISCONNECTED ||
+            status == STATUS_CONNECTION_ABORTED || status == STATUS_LOCAL_DISCONNECT || status == STATUS_REMOTE_DISCONNECT;
+    }
     static void InjectionFailed(Flow* flow, NTSTATUS status, bool zero_fin, bool submission_failed) {
         // A synchronous lookup failure means there is no stream left to inject
         // into. Keep that terminal transport outcome distinct from policy blocks.
         const bool origin_exited = status == STATUS_INVALID_DEVICE_STATE && OriginExited(flow);
         KIRQL irql;
         KeAcquireSpinLock(&flow->lock, &irql);
-        const bool unavailable = (submission_failed && status == STATUS_NOT_FOUND) ||
+        const bool unavailable = TransportClosed(status) || (submission_failed && status == STATUS_NOT_FOUND) ||
                                  ((flow->closing || origin_exited) && status == STATUS_INVALID_DEVICE_STATE);
         const bool closed = flow->verdict == Verdict::Closed;
         if (!closed) { flow->verdict = unavailable ? Verdict::Closed : Verdict::Block; }
@@ -412,8 +495,10 @@ class Driver {
             }
             Segment* segment = nullptr;
             if (flow->verdict == Verdict::Unknown || flow->verdict == Verdict::Allow) {
-                LIST_ENTRY* queue = !IsListEmpty(&flow->receiving) ? &flow->receiving : &flow->sending;
-                if (!IsListEmpty(queue) && (queue == &flow->receiving || flow->verdict == Verdict::Allow)) {
+                LIST_ENTRY* greeting_queue = flow->server ? &flow->sending : &flow->receiving;
+                LIST_ENTRY* queue = flow->verdict == Verdict::Unknown ? greeting_queue :
+                    (!IsListEmpty(&flow->receiving) ? &flow->receiving : &flow->sending);
+                if (!IsListEmpty(queue)) {
                     segment = CONTAINING_RECORD(RemoveHeadList(queue), Segment, link);
                     flow->queued -= segment->length;
                 }
@@ -468,7 +553,8 @@ class Driver {
         KeSetEvent(&state.stopped, IO_NO_INCREMENT, FALSE);
     }
     static NTSTATUS SetDecision(const guard::NetDecision& decision) {
-        if (decision.version != guard::kVersion || decision.block > 1) { return STATUS_INVALID_PARAMETER; }
+        if (decision.version != guard::kVersion || decision.block > 1 || decision.source_verified > 1 ||
+            decision.reserved != 0 || (decision.block != 0 && decision.source_verified != 0)) { return STATUS_INVALID_PARAMETER; }
         Flow* target = nullptr;
         KIRQL irql;
         KeAcquireSpinLock(&state.flows_lock, &irql);
@@ -479,8 +565,12 @@ class Driver {
         KeReleaseSpinLock(&state.flows_lock, irql);
         if (target == nullptr) { return STATUS_NOT_FOUND; }
         KeAcquireSpinLock(&target->lock, &irql);
-        const bool pending = target->verdict == Verdict::Waiting;
-        if (pending) { target->verdict = decision.block ? Verdict::Block : Verdict::Allow; }
+        const bool pending = target->verdict == Verdict::Waiting &&
+            (decision.source_verified == 0 || (target->data_flow && !target->explicit_tls));
+        if (pending) {
+            target->verdict = decision.block ? Verdict::Block : Verdict::Allow;
+            target->source_verified = decision.source_verified != 0;
+        }
         KeReleaseSpinLock(&target->lock, irql);
         if (pending && !decision.block) { InterlockedIncrement64(&state.allowed); QueueEvent(target, guard::NetEventKind::Allowed); }
         Release(target);

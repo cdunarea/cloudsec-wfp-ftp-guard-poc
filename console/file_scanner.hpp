@@ -22,7 +22,7 @@ struct ScanResult {
 class FileScanner {
  public:
     ScanResult Scan(DWORD process_id, std::uint64_t process_created, DWORD budget_ms = 8000,
-                    const std::vector<std::wstring>& recent_files = {}) const;
+                    const std::vector<std::wstring>& recent_files = {}, bool source_paths_only = false) const;
     // Also used by deterministic tests on real Windows file handles.
     ScanResult InspectFile(HANDLE file, DWORD budget_ms = 8000) const;
     static bool SecretFilename(const std::wstring& path);
@@ -45,5 +45,6 @@ class FileScanner {
     static void ReadContent(HANDLE file, ULONGLONG deadline, ScanResult& result);
     static void Inspect(HANDLE file, ULONGLONG deadline, ScanResult& result);
     static void InspectRecent(const std::wstring& path, ULONGLONG deadline, ScanResult& result);
+    static void InspectPaths(const std::vector<std::wstring>& paths, ULONGLONG deadline, ScanResult& result);
 };
 }  // namespace guard

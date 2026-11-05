@@ -29,6 +29,7 @@ class FtpProbe {
         return verdict_ == ProtocolVerdict::Ftp &&
             (TokenEquals("STOR", 4) || TokenEquals("APPE", 4) || TokenEquals("STOU", 4));
     }
+    bool IsDownload() const { return verdict_ == ProtocolVerdict::Ftp && TokenEquals("RETR", 4); }
     bool IsTlsUpgrade() const { return verdict_ == ProtocolVerdict::Ftp && TokenEquals("AUTH", 4); }
 
  private:
@@ -51,6 +52,13 @@ class FtpProbe {
             if (Upper(static_cast<unsigned char>(client_[i])) != static_cast<unsigned char>(token[i])) { return false; }
         }
         return i == length && token[i] == '\0';
+    }
+    bool TlsCommand(size_t token) const {
+        if (!TokenEquals("AUTH", token) || sent_ != 10 || client_[4] != ' ') { return false; }
+        const auto first = Upper(static_cast<unsigned char>(client_[5]));
+        const auto second = Upper(static_cast<unsigned char>(client_[6]));
+        const auto third = Upper(static_cast<unsigned char>(client_[7]));
+        return (first == 'T' && second == 'L' && third == 'S') || (first == 'S' && second == 'S' && third == 'L');
     }
     bool PossibleCommand() const {
         static const char* const commands[] = {
@@ -95,9 +103,7 @@ class FtpProbe {
         for (const char* command : distinctive) { if (TokenEquals(command, token)) { ftp = true; break; } }
         if (greeting_ && (TokenEquals("USER", token) || TokenEquals("PASS", token) || TokenEquals("ACCT", token) ||
                           TokenEquals("QUIT", token) || TokenEquals("NOOP", token))) { ftp = true; }
-        if (TokenEquals("AUTH", token) && sent_ == 10 && client_[4] == ' ' &&
-            Upper(static_cast<unsigned char>(client_[5])) == 'T' && Upper(static_cast<unsigned char>(client_[6])) == 'L' &&
-            Upper(static_cast<unsigned char>(client_[7])) == 'S') { ftp = true; }
+        if (TlsCommand(token)) { ftp = true; }
         verdict_ = ftp ? ProtocolVerdict::Ftp : ProtocolVerdict::Other;
         if (ftp) {
             const size_t copy = token < sizeof(verb_) - 1 ? token : sizeof(verb_) - 1;

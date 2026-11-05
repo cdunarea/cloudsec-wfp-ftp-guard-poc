@@ -42,7 +42,8 @@ class Diagnostics {
         output << "[CONNECTION] {source=" << source << ", flow=" << event.flow << ", pid=" << event.process_id
                << ", image=\"" << Utf8(std::filesystem::path(path).filename().wstring()) << "\", path=\"" << Utf8(path)
                << "\", session=" << session << ", local=" << Address(event.family, event.local_address) << ':' << event.local_port
-               << ", remote=" << Address(event.family, event.remote_address) << ':' << event.remote_port << '}';
+               << ", remote=" << Address(event.family, event.remote_address) << ':' << event.remote_port
+               << ", direction=" << ((event.flags & NetInbound) != 0 ? "inbound" : "outbound") << '}';
         Line(output.str());
     }
 };

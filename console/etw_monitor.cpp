@@ -116,6 +116,12 @@ ULONG EtwMonitor::Number(EVENT_RECORD* record, const wchar_t* name) {
     if (!bytes.empty() && bytes.size() <= sizeof(number)) { memcpy_s(&number, sizeof(number), bytes.data(), bytes.size()); }
     return number;
 }
+UINT64 EtwMonitor::PointerNumber(EVENT_RECORD* record, const wchar_t* name) {
+    const auto bytes = Property(record, name);
+    UINT64 number = 0;
+    if (!bytes.empty() && bytes.size() <= sizeof(number)) { memcpy_s(&number, sizeof(number), bytes.data(), bytes.size()); }
+    return number;
+}
 
 std::string EtwMonitor::Ansi(EVENT_RECORD* record, const wchar_t* name) {
     const auto bytes = Property(record, name);
@@ -132,18 +138,30 @@ std::wstring EtwMonitor::Wide(EVENT_RECORD* record, const wchar_t* name) {
     return value;
 }
 void EtwMonitor::FileRecord(EVENT_RECORD* record) {
-    if (record->EventHeader.EventDescriptor.Opcode != 64) { return; }
+    const auto opcode = record->EventHeader.EventDescriptor.Opcode;
+    if (opcode != 64 && opcode != 66 && opcode != 67) { return; }
     const auto pid = record->EventHeader.ProcessId;
-    {
-        std::lock_guard lock(mutex_);
-        if (std::find(file_processes_.begin(), file_processes_.end(), pid) == file_processes_.end()) { return; }
-    }
-    const auto path = Wide(record, L"OpenPath");
-    if (path.empty() || path.back() == L'\\' || (Number(record, L"CreateOptions") & 1U) != 0) { return; }
+    const auto object = PointerNumber(record, L"FileObject");
     const auto at = record->EventHeader.TimeStamp.QuadPart;
     if (at <= 0) { return; }
+    if (opcode != 64) {
+        std::lock_guard lock(mutex_);
+        if (opcode == 66) { file_reads_.Close(object); }
+        else if (Number(record, L"IoSize") != 0 && file_reads_.Read(pid, object, static_cast<UINT64>(at))) { ++file_reads_observed_; }
+        return;
+    }
+    bool known = false;
+    {
+        std::lock_guard lock(mutex_);
+        known = std::find(file_processes_.begin(), file_processes_.end(), pid) != file_processes_.end();
+    }
+    // Capture a selected client's opens even before its first TCP connection.
+    if (!known && !Relevant(pid)) { return; }
+    const auto path = Wide(record, L"OpenPath");
+    if (path.empty() || path.back() == L'\\' || (Number(record, L"CreateOptions") & 1U) != 0) { return; }
     std::lock_guard lock(mutex_);
     file_activity_.Record(pid, static_cast<UINT64>(at), path);
+    file_reads_.Open(pid, object, static_cast<UINT64>(at), path);
     ++file_opens_;
 }
 UINT64 EtwMonitor::FileTimeNow() {
@@ -152,7 +170,9 @@ UINT64 EtwMonitor::FileTimeNow() {
     return (static_cast<UINT64>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
 }
 NetFileEvidence EtwMonitor::RecentFiles(const NetEvent& event) {
-    if (!file_history_ || sessions_[0].controller == 0 || sessions_[0].consumer == INVALID_PROCESSTRACE_HANDLE) { return {}; }
+    if (!file_history_ || sessions_[0].controller == 0 || sessions_[0].consumer == INVALID_PROCESSTRACE_HANDLE) {
+        return {{}, false, "file-open history unavailable; transfer inspection cannot certify closed handles"};
+    }
     auto& session = sessions_[0];
     auto storage = session.properties;
     auto* properties = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(storage.data());
@@ -164,12 +184,28 @@ NetFileEvidence EtwMonitor::RecentFiles(const NetEvent& event) {
     if (properties->EventsLost != 0 || properties->RealTimeBuffersLost != 0) { return {{}, false, "ETW file evidence lost"}; }
     // BufferCallback runs after every event in a delivered buffer. Wait for the
     // flushed buffer count, rather than guessing when the timer has delivered it.
-    const bool delivered = session.progress.Wait(properties->BuffersWritten, std::chrono::milliseconds(2000));
-    Diagnostics::Line("[ETW SYNC] flushed_buffers=" + std::to_string(properties->BuffersWritten) +
+    const auto target = properties->BuffersWritten;
+    bool delivered = session.progress.Wait(target, std::chrono::milliseconds(1000));
+    if (!delivered) {
+        // A real-time consumer can still have a partial producer buffer. Flush
+        // again and wait for the original barrier, without chasing new buffers.
+        const ULONG retry = ControlTraceW(session.controller, session.name.c_str(), properties, EVENT_TRACE_CONTROL_FLUSH);
+        if (retry != ERROR_SUCCESS || properties->EventsLost != 0 || properties->RealTimeBuffersLost != 0) {
+            return {{}, false, "ETW retry flush failed or lost file evidence: error=" + std::to_string(retry)};
+        }
+        delivered = session.progress.Wait(target, std::chrono::milliseconds(3000));
+    }
+    Diagnostics::Line("[ETW SYNC] flushed_buffers=" + std::to_string(target) +
         " delivered_buffers=" + std::to_string(session.progress.Buffers()) + " elapsed_ms=" + std::to_string(GetTickCount64() - started));
     if (!delivered) { return {{}, false, "ETW file evidence delivery timed out or consumer stopped"}; }
     std::lock_guard lock(mutex_);
-    return {file_activity_.Paths(event.process_id, event.captured_at, FileTimeNow()), true, {}};
+    const auto since = event.file_since != 0 ? event.file_since : event.captured_at;
+    const bool data = (event.flags & NetData) != 0;
+    if ((data ? file_reads_.Evictions() : file_activity_.Evictions()) != 0) {
+        return {{}, false, "bounded file evidence cache evicted records"};
+    }
+    return {data ? file_reads_.Paths(event.process_id, since, FileTimeNow()) :
+                   file_activity_.Paths(event.process_id, since, FileTimeNow()), true, {}};
 }
 
 void WINAPI EtwMonitor::Callback(EVENT_RECORD* record) {
@@ -262,6 +298,6 @@ std::string EtwMonitor::Summary() const {
     return "[ETW SUMMARY] tcp_connections=" + std::to_string(connections_.load()) + " wininet_ftp=" +
            std::to_string(wininet_ftp_.load()) + " correlated=" + std::to_string(correlations_.load()) +
            " wininet_events=" + std::to_string(wininet_events_.load()) + " wininet_connections=" + std::to_string(wininet_connections_.load()) +
-           " file_opens=" + std::to_string(file_opens_.load());
+           " file_opens=" + std::to_string(file_opens_.load()) + " source_reads=" + std::to_string(file_reads_observed_.load());
 }
 }  // namespace guard

@@ -9,6 +9,7 @@
 #include <vector>
 #include "file_scanner.hpp"
 #include "ftp_probe.hpp"
+#include "ftp_transfer.hpp"
 #include "file_activity.hpp"
 #include "trace_progress.hpp"
 #include <future>
@@ -19,7 +20,9 @@ class Tests {
     static int Run() {
         Parser();
         UploadCommands();
+        TransferCommands();
         FileActivity();
+        FileReads();
         TraceProgress();
         Matchers();
         Files();
@@ -43,7 +46,7 @@ class Tests {
             "USER anonymous\r\n", "PASS password\r\n", "ACCT account\r\n", "QUIT\r\n", "NOOP\r\n", "SYST\r\n", "FEAT\r\n",
             "PASV\r\n", "EPSV\r\n", "TYPE I\r\n", "OPTS UTF8 ON\r\n", "RETR a.txt\r\n", "STOR a.txt\r\n", "APPE a.txt\r\n", "STOU\r\n",
             "CWD /\r\n", "CDUP\r\n", "PWD\r\n", "DELE a.txt\r\n", "MKD dir\r\n", "RMD dir\r\n", "RNFR old\r\n", "RNTO new\r\n",
-            "PORT 127,0,0,1,1,2\r\n", "EPRT |1|127.0.0.1|4242|\r\n", "AUTH TLS\r\n", "USER Jos\xC3\xA9\r\n"};
+            "PORT 127,0,0,1,1,2\r\n", "EPRT |1|127.0.0.1|4242|\r\n", "AUTH TLS\r\n", "AUTH SSL\r\n", "USER Jos\xC3\xA9\r\n"};
         for (auto line : valid) {
             for (int lowercase = 0; lowercase < 2; ++lowercase) {
                 if (lowercase) { std::transform(line.begin(), line.end(), line.begin(), [](unsigned char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : static_cast<char>(c); }); }
@@ -113,6 +116,67 @@ class Tests {
         probe.Reset();
         Check(FeedUpload(probe, "STOR clear.txt\r\n"), "new connection re-enables upload inspection");
     }
+    static void TransferCommands() {
+        using guard::NetTransferVerb;
+        const std::vector<std::pair<std::string, NetTransferVerb>> commands{
+            {"STOR source.dat\r\n", NetTransferVerb::Upload}, {"aPpE source.dat\r\n", NetTransferVerb::Upload},
+            {"STOU\r\n", NetTransferVerb::Upload}, {"rEtR source.dat\r\n", NetTransferVerb::Download}};
+        for (const auto& [line, expected] : commands) {
+            for (size_t cut = 0; cut < line.size(); ++cut) {
+                guard::NetFtpTransferProbe probe; probe.Reset();
+                Check(!probe.Feed(nullptr, 0), "empty transfer input is safe");
+                const std::string prefix = "USER lab\r\nTYPE I\r\n";
+                Check(!probe.Feed(reinterpret_cast<const unsigned char*>(prefix.data()), prefix.size()),
+                      "login does not request a transfer scan");
+                Check(!probe.Feed(reinterpret_cast<const unsigned char*>(line.data()), cut), "partial transfer waits for CRLF");
+                Check(probe.Feed(reinterpret_cast<const unsigned char*>(line.data() + cut), line.size() - cut) &&
+                      probe.Transfer() == expected && !probe.TlsRequested(), "upload and RETR across every split");
+                Check(std::string(probe.Verb()).find("source") == std::string::npos, "transfer evidence excludes file arguments");
+            }
+        }
+        for (const std::string auth : {std::string("AUTH TLS\r\n"), std::string("AUTH SSL\r\n")}) {
+        for (size_t cut = 0; cut <= auth.size(); ++cut) {
+            guard::NetFtpTransferProbe probe; probe.Reset();
+            probe.Feed(reinterpret_cast<const unsigned char*>(auth.data()), cut);
+            probe.Feed(reinterpret_cast<const unsigned char*>(auth.data() + cut), auth.size() - cut);
+            Check(probe.TlsRequested() && std::string(probe.Verb()) == "AUTH", "explicit TLS transition across every split");
+            const std::string opaque = "\x17\x03\x03\x00\x13STOR hidden.dat\r\n";
+            Check(!probe.Feed(reinterpret_cast<const unsigned char*>(opaque.data()), opaque.size()) &&
+                  probe.Transfer() == NetTransferVerb::None, "encrypted traffic is not parsed as FTP commands");
+            probe.Reset();
+            Check(!probe.TlsRequested() && probe.Transfer() == NetTransferVerb::None && std::string(probe.Verb()).empty(),
+                  "reset removes prior TLS and transfer state");
+        }
+        }
+        guard::NetFtpTransferProbe probe; probe.Reset();
+        const std::string malformed = "XYZ RETR hidden\r\nRETR bad\n" + std::string(600, 'X') + "\r\nRETR good\r\n";
+        Check(probe.Feed(reinterpret_cast<const unsigned char*>(malformed.data()), malformed.size()) &&
+              probe.Transfer() == NetTransferVerb::Download, "transfer parser recovers after invalid and oversized lines");
+        for (const bool server : {false, true}) {
+            for (const bool tls : {false, true}) {
+                for (const auto transfer : {NetTransferVerb::None, NetTransferVerb::Upload, NetTransferVerb::Download}) {
+                    const bool sender = (server && transfer == NetTransferVerb::Download) || (!server && transfer == NetTransferVerb::Upload);
+                    Check(guard::NetTransferGate::SendsFile(server, transfer) == sender, "local file sender follows logical FTP role");
+                    Check(!guard::NetTransferGate::InspectData(server, tls, transfer, 0), "zero-length FIN never requests a file scan");
+                    Check(guard::NetTransferGate::InspectData(server, tls, transfer, 1) == (tls || sender),
+                          "outgoing data is gated for source transfers and conservative explicit FTPS correlation");
+                    const std::string evidence = guard::NetTransferGate::Evidence(server, tls);
+                    Check(evidence == (tls ? (server ? "FTPS-SERVER-DATA" : "FTPS-CLIENT-DATA") :
+                                            (server ? "RETR-DATA" : "UPLOAD-DATA")), "diagnostics identify sender role and encryption");
+                }
+            }
+        }
+        Check(!guard::NetTransferGate::GrantDataFlow(false, false, false, 1), "a control command cannot authorize a data connection");
+        Check(!guard::NetTransferGate::GrantDataFlow(true, true, false, 1), "a TLS certificate read cannot authorize later encrypted file data");
+        Check(!guard::NetTransferGate::GrantDataFlow(true, false, true, 1), "a denied source never receives a retained grant");
+        Check(!guard::NetTransferGate::GrantDataFlow(true, false, false, 0), "missing source evidence cannot authorize a data connection");
+        Check(guard::NetTransferGate::GrantDataFlow(true, false, false, 1), "a verified plaintext source can finish its single-file data connection");
+        Check(guard::NetTransferGate::DataCandidate(false, false, false, NetTransferVerb::None), "ordinary correlated data remains a candidate");
+        Check(!guard::NetTransferGate::DataCandidate(true, false, false, NetTransferVerb::None), "an unrelated greeting without a transfer retains control parsing");
+        Check(guard::NetTransferGate::DataCandidate(true, true, false, NetTransferVerb::Download), "server file bytes beginning with 220 cannot bypass RETR inspection");
+        Check(guard::NetTransferGate::DataCandidate(true, false, false, NetTransferVerb::Upload), "client file bytes beginning with 220 cannot bypass upload inspection");
+        Check(guard::NetTransferGate::DataCandidate(true, true, true, NetTransferVerb::None), "explicit FTPS clear data beginning with 220 remains gated");
+    }
     static void FileActivity() {
         constexpr std::uint64_t now = 134000000000000000ULL;
         guard::NetFileActivityCache cache;
@@ -132,6 +196,32 @@ class Tests {
         for (std::uint64_t i = 0; i < 1100; ++i) { cache.Record(7, now + i, std::to_wstring(i)); }
         const auto bounded = cache.Paths(7, now, now + 1100);
         Check(bounded.size() == 1024 && bounded.front() == L"76" && bounded.back() == L"1099", "file evidence cache evicts oldest records at its capacity");
+    }
+    static void FileReads() {
+        constexpr std::uint64_t now = 134000000000000000ULL;
+        guard::NetFileReadCache cache;
+        cache.Open(0, 1, now, L"invalid"); cache.Open(7, 0, now, L"invalid");
+        cache.Open(7, 1, 0, L"invalid"); cache.Open(7, 1, now, L"");
+        cache.Read(7, 1, now);
+        Check(cache.Paths(7, now, now).empty() && cache.Evictions() == 0, "invalid file objects do not create read evidence");
+        cache.Open(7, 1, now, L"source.bin");
+        cache.Read(8, 1, now); cache.Read(7, 1, now - 1); cache.Read(7, 2, now);
+        Check(cache.Paths(7, now - 1, now).empty(), "read evidence requires matching object, owner and lifetime");
+        cache.Read(7, 1, now + 1); cache.Read(0, 1, now + 2); cache.Read(0xffffffffULL, 1, now + 3);
+        Check(cache.Paths(7, now, now + 3) == std::vector<std::wstring>{L"source.bin"},
+              "read events deduplicate and can use the create-event owner when the header PID is unavailable");
+        cache.Close(999); cache.Close(1);
+        cache.Read(7, 1, now + 4);
+        Check(cache.Paths(7, now + 4, now + 4).empty(), "close removes the object association");
+        cache.Open(7, 2, now, L"old.bin"); cache.Open(8, 2, now + 1, L"new.bin");
+        cache.Read(7, 2, now + 2); cache.Read(8, 2, now + 2);
+        Check(cache.Paths(8, now, now + 2) == std::vector<std::wstring>{L"new.bin"}, "object reuse replaces the old owner");
+        for (std::uint64_t i = 1; i <= 4097; ++i) { cache.Open(9, i + 10, now, std::to_wstring(i)); }
+        cache.Read(9, 11, now + 1);
+        Check(cache.Evictions() != 0 && cache.Paths(9, now, now + 1).empty(), "object map eviction is bounded and observable");
+        for (std::uint64_t i = 0; i < 1100; ++i) { cache.Read(9, 4107, now + 10 + i); }
+        Check(cache.Evictions() > 1, "read history eviction is observable independently of object-map capacity");
+        Check(cache.Paths(9, now, now + 40ULL * 10000000).empty(), "read evidence expires after thirty seconds");
     }
     static void TraceProgress() {
         using namespace std::chrono_literals;
@@ -218,6 +308,21 @@ class Tests {
             const auto result = scanner.InspectFile(file.Get());
             Check(result.verdict == guard::ScanVerdict::SecretName && result.bytes == 0, "filename match blocks without reading content");
             Check(scanner.Scan(GetCurrentProcessId(), process_created).verdict == guard::ScanVerdict::SecretName, "native process handle snapshot finds named file");
+            Check(scanner.Scan(GetCurrentProcessId(), process_created, 8000, {path.wstring()}, true).verdict == guard::ScanVerdict::SecretName,
+                  "on-demand scan checks the observed transfer source");
+            Check(scanner.Scan(GetCurrentProcessId(), process_created, 8000, {}, true).verdict == guard::ScanVerdict::Clear,
+                  "an unrelated long-lived open file does not become an on-demand transfer source");
+        }
+        {
+            const auto path = root / L"secret-write-only-log.txt";
+            guard::WinHandle log(CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                             nullptr, CREATE_NEW, 0, nullptr));
+            if (!log.Valid()) { throw std::runtime_error("unit write-only log"); }
+            Write(log.Get(), "secret diagnostic log");
+            Check(scanner.Scan(GetCurrentProcessId(), process_created, 8000, {}, true).verdict == guard::ScanVerdict::Clear,
+                  "write-only logs are not outgoing source handles");
+            Check(scanner.Scan(GetCurrentProcessId(), process_created).verdict == guard::ScanVerdict::SecretName,
+                  "legacy all-handle scan remains available for diagnostics");
         }
         const std::vector<std::string> contents{"public", "", "prefix SeCrEt suffix", std::string(65533,'a') + "secret", std::string("s\0e\0c\0r\0e\0t\0",12), std::string("\0s\0e\0c\0r\0e\0t",12)};
         for (size_t i = 0; i < contents.size(); ++i) {

@@ -48,7 +48,9 @@ class EtwMonitor {
     std::deque<Observation> observations_;
     std::deque<UINT64> file_processes_;
     NetFileActivityCache file_activity_;
+    NetFileReadCache file_reads_;
     std::atomic<UINT64> file_opens_{0};
+    std::atomic<UINT64> file_reads_observed_{0};
     std::atomic<UINT64> connections_{0};
     std::atomic<UINT64> correlations_{0};
     std::atomic<UINT64> wininet_ftp_{0};
@@ -67,6 +69,7 @@ class EtwMonitor {
     static bool SameTuple(const NetEvent& left, const NetEvent& right);
     static std::vector<unsigned char> Property(EVENT_RECORD* record, const wchar_t* name);
     static ULONG Number(EVENT_RECORD* record, const wchar_t* name);
+    static UINT64 PointerNumber(EVENT_RECORD* record, const wchar_t* name);
     static std::string Ansi(EVENT_RECORD* record, const wchar_t* name);
     static std::wstring Wide(EVENT_RECORD* record, const wchar_t* name);
     void FileRecord(EVENT_RECORD* record);

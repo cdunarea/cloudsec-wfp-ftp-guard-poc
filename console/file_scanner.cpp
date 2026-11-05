@@ -140,16 +140,21 @@ void FileScanner::InspectRecent(const std::wstring& path, ULONGLONG deadline, Sc
     if (!file.Valid()) { Incomplete(result, "Open recent file", GetLastError()); return; }
     ++result.recent_files;
     Inspect(file.Get(), deadline, result);
+    if (result.verdict == ScanVerdict::Clear && result.path.empty() && result.files != 0) { result.path = FilePath(file.Get()); }
     if (result.verdict == ScanVerdict::SecretName || result.verdict == ScanVerdict::SecretContent) { result.recent_match = true; }
 }
 
 ScanResult FileScanner::Scan(DWORD process_id, std::uint64_t process_created, DWORD budget_ms,
-                            const std::vector<std::wstring>& recent_files) const {
+                            const std::vector<std::wstring>& recent_files, bool source_paths_only) const {
     ScanResult result;
     WinHandle process(OpenProcess(PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id));
     if (!process.Valid()) { Incomplete(result, "OpenProcess", GetLastError()); return result; }
     if (process_created == 0 || CreationTime(process.Get()) != process_created) {
         Incomplete(result, "Process identity changed or creation time unavailable", ERROR_INVALID_OWNER);
+        return result;
+    }
+    if (source_paths_only) {
+        InspectPaths(recent_files, GetTickCount64() + budget_ms, result);
         return result;
     }
     std::array<wchar_t, 32768> executable{};
@@ -186,10 +191,13 @@ ScanResult FileScanner::Scan(DWORD process_id, std::uint64_t process_created, DW
         if (result.verdict == ScanVerdict::SecretName || result.verdict == ScanVerdict::SecretContent) { break; }
     }
     if (result.verdict == ScanVerdict::SecretName || result.verdict == ScanVerdict::SecretContent) { return result; }
-    for (const auto& path : recent_files) {
-        InspectRecent(path, deadline, result);
-        if (result.verdict == ScanVerdict::SecretName || result.verdict == ScanVerdict::SecretContent) { break; }
-    }
+    InspectPaths(recent_files, deadline, result);
     return result;
+}
+void FileScanner::InspectPaths(const std::vector<std::wstring>& paths, ULONGLONG deadline, ScanResult& result) {
+    for (const auto& path : paths) {
+        InspectRecent(path, deadline, result);
+        if (result.verdict == ScanVerdict::SecretName || result.verdict == ScanVerdict::SecretContent) { return; }
+    }
 }
 }  // namespace guard

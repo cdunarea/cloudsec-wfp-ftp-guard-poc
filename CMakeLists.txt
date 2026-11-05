@@ -35,7 +35,7 @@ add_custom_command(OUTPUT "${driver_dir}/WfpFtpGuard.sys"
         "${wdk_lib}/ntoskrnl.lib" "${wdk_lib}/hal.lib" "${wdk_lib}/fwpkclnt.lib"
         "${wdk_lib}/ndis.lib" "${wdk_lib}/wdmsec.lib"
         "${wdk_lib}/BufferOverflowFastFailK.lib"
-    DEPENDS driver/driver.cpp common/protocol.hpp common/ids.hpp common/ftp_probe.hpp
+    DEPENDS driver/driver.cpp common/protocol.hpp common/ids.hpp common/ftp_probe.hpp common/ftp_transfer.hpp
     VERBATIM)
 add_custom_target(ftp-driver ALL DEPENDS "${driver_dir}/WfpFtpGuard.sys")
 

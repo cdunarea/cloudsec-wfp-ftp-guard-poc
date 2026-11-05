@@ -8,6 +8,7 @@
 #include "net_driver_session.hpp"
 #include "etw_monitor.hpp"
 #include "file_scanner.hpp"
+#include "ftp_transfer.hpp"
 
 class Console {
  public:
@@ -19,6 +20,9 @@ class Console {
         struct SocketLifetime { ~SocketLifetime() { WSACleanup(); } } socket_lifetime;
         SetConsoleOutputCP(CP_UTF8);
         SetConsoleCtrlHandler(Ctrl, TRUE);
+        guard::WinHandle stop_event(CreateEventW(nullptr, TRUE, FALSE,
+            options.stop_event.empty() ? nullptr : options.stop_event.c_str()));
+        if (!stop_event.Valid()) { throw std::runtime_error("Cannot create shutdown event"); }
         EnableDebugPrivilege();
         guard::EtwMonitor etw(options.application, !options.etw_only);
         if (options.etw && !etw.Start() && options.etw_only) { throw std::runtime_error("ETW network session could not be started (run elevated)"); }
@@ -27,10 +31,11 @@ class Console {
         guard::Diagnostics::Line("[READY] " + std::string(options.etw_only ? "ETW only; no driver loaded, no blocking" : "WFP enforcement active") +
             "; Ctrl+C to stop; app=" + (options.application.empty() ? "all applications" : guard::Diagnostics::Utf8(options.application)));
         const ULONGLONG deadline = options.seconds == 0 ? 0 : GetTickCount64() + static_cast<ULONGLONG>(options.seconds) * 1000;
-        while (!stopping_.load() && (deadline == 0 || GetTickCount64() < deadline)) {
+        while (!stopping_.load() && WaitForSingleObject(stop_event.Get(), 0) == WAIT_TIMEOUT &&
+               (deadline == 0 || GetTickCount64() < deadline)) {
             guard::NetEvent event{};
             if (driver && driver->Next(event)) { Handle(*driver, etw, event); }
-            else { Sleep(25); }
+            else { WaitForSingleObject(stop_event.Get(), 25); }
         }
         if (driver) {
             const auto status = driver->ReadStatus();
@@ -46,6 +51,7 @@ class Console {
     struct Options {
         std::wstring driver;
         std::wstring application;
+        std::wstring stop_event;
         DWORD seconds = 0;
         bool etw = true;
         bool etw_only = false;
@@ -59,8 +65,10 @@ class Console {
     static void Help() {
         guard::Diagnostics::Line("ftp-guard [--driver file.sys] [--app full-path.exe] [--seconds N] [--no-etw]\n"
             "ftp-guard --etw-only [--app full-path.exe] [--seconds N]\n"
-            "Run elevated. Default: monitor outbound IPv4/IPv6 TCP on every port.\n"
-            "Driver confirms plaintext FTP control commands; ETW alone reports TCP candidates and WinINet FTP API events.");
+            "Optional --stop-event Local\\name allows a test controller to request orderly unload.\n"
+            "Run elevated. Monitor inbound/outbound IPv4/IPv6 TCP on every port.\n"
+            "On-demand scans guard client uploads and server RETR data. Explicit FTPS uses conservative process/peer correlation; TLS is not decrypted.\n"
+            "ETW supplies short-lived file-open evidence. --no-etw makes required transfer evidence incomplete (blocked).");
     }
     static Options Parse(int argc, wchar_t** argv) {
         Options options;
@@ -78,10 +86,11 @@ class Console {
             if (option == L"--help" || option == L"-h") { options.help = true; }
             else if (option == L"--etw-only") { options.etw_only = true; }
             else if (option == L"--no-etw") { options.etw = false; }
-            else if ((option == L"--driver" || option == L"--app" || option == L"--seconds") && i + 1 < argc) {
+            else if ((option == L"--driver" || option == L"--app" || option == L"--seconds" || option == L"--stop-event") && i + 1 < argc) {
                 const std::wstring value = argv[++i];
                 if (option == L"--driver") { options.driver = std::filesystem::absolute(value).wstring(); }
                 if (option == L"--app") { options.application = std::filesystem::absolute(value).wstring(); }
+                if (option == L"--stop-event") { options.stop_event = value; }
                 if (option == L"--seconds") {
                     size_t consumed = 0;
                     const auto seconds = std::stoul(value, &consumed);
@@ -106,6 +115,13 @@ class Console {
     }
     static void Handle(guard::NetDriverSession& driver, guard::EtwMonitor& etw, const guard::NetEvent& event) {
         if (event.kind == guard::NetEventKind::Flow) { guard::Diagnostics::Connection("WFP", event); etw.DriverConnection(event); return; }
+        if (event.kind == guard::NetEventKind::FtpControl || event.kind == guard::NetEventKind::Transfer) {
+            guard::Diagnostics::Line(std::string(event.kind == guard::NetEventKind::FtpControl ? "[FTP CONFIRMED]" : "[FTP TRANSFER]") +
+                " flow=" + std::to_string(event.flow) + " pid=" + std::to_string(event.process_id) +
+                " role=" + ((event.flags & guard::NetServer) != 0 ? "server" : "client") +
+                " command=" + event.evidence + ((event.flags & guard::NetExplicitTls) != 0 ? " explicit-ftps=recognized plaintext-after-upgrade=unavailable" : ""));
+            return;
+        }
         if (event.kind == guard::NetEventKind::InspectFtp) { Inspect(driver, etw, event); return; }
         const char* kind = event.kind == guard::NetEventKind::Blocked ? "BLOCKED" : event.kind == guard::NetEventKind::Allowed ? "ALLOWED" :
                            event.kind == guard::NetEventKind::Closed ? "CLOSED" : "ERROR";
@@ -114,25 +130,40 @@ class Console {
             (event.kind == guard::NetEventKind::Error || event.kind == guard::NetEventKind::Closed ? " context=" + std::string(event.evidence) : ""));
     }
     static void Inspect(guard::NetDriverSession& driver, guard::EtwMonitor& etw, const guard::NetEvent& event) {
-        guard::Diagnostics::Line("[FTP CONFIRMED] flow=" + std::to_string(event.flow) + " pid=" + std::to_string(event.process_id) +
-            " port=" + std::to_string(event.remote_port) + " control-command=" + std::string(event.evidence));
-        const std::string command(event.evidence);
-        const bool upload = command == "STOR" || command == "APPE" || command == "STOU";
-        const auto recent = upload ? etw.RecentFiles(event) : guard::NetFileEvidence{};
-        auto result = guard::FileScanner().Scan(static_cast<DWORD>(event.process_id), event.process_created, 8000, recent.paths);
+        guard::Diagnostics::Line("[TRANSFER INSPECTION] flow=" + std::to_string(event.flow) + " pid=" + std::to_string(event.process_id) +
+            " role=" + ((event.flags & guard::NetServer) != 0 ? "server" : "client") +
+            " trigger=" + event.evidence + " control_flow=" + std::to_string(event.control_flow) +
+            ((event.flags & guard::NetData) != 0 ? " association=process-and-peer" : " association=control-command") +
+            ((event.flags & guard::NetAmbiguous) != 0 ? " ambiguous=yes" : "") +
+            ((event.flags & guard::NetExplicitTls) != 0 ? " control-upgrade=requested data-protection=unavailable decrypted=no" : ""));
+        const auto recent = etw.RecentFiles(event);
+        auto result = guard::FileScanner().Scan(static_cast<DWORD>(event.process_id), event.process_created, 8000, recent.paths, true);
         if (!recent.complete && result.verdict == guard::ScanVerdict::Clear) {
             result.verdict = guard::ScanVerdict::Incomplete;
             result.detail = recent.detail;
         }
+        if (result.verdict == guard::ScanVerdict::Clear && result.files == 0 && (event.flags & guard::NetData) != 0) {
+            if ((event.flags & guard::NetExplicitTls) == 0) {
+                result.verdict = guard::ScanVerdict::Incomplete;
+                result.detail = "outgoing FTP data has no observed source read";
+            } else {
+                guard::Diagnostics::Line("[COVERAGE] flow=" + std::to_string(event.flow) +
+                    " explicit FTPS candidate without a source read; passed for handshake compatibility; no content verdict");
+            }
+        }
         const char* rule = result.verdict == guard::ScanVerdict::SecretName ? "secret-filename" :
                            result.verdict == guard::ScanVerdict::SecretContent ? "secret-content" :
-                           result.verdict == guard::ScanVerdict::Incomplete ? "inspection-incomplete" : "no-secret-open-file";
-        const bool accepted = driver.Decide(event.flow, result.Block());
+                           result.verdict == guard::ScanVerdict::Incomplete ? "inspection-incomplete" :
+                           result.files == 0 ? "no-source-observed" : "source-files-clear";
+        const bool verified = guard::NetTransferGate::GrantDataFlow((event.flags & guard::NetData) != 0,
+            (event.flags & guard::NetExplicitTls) != 0, result.Block(), result.files);
+        const bool accepted = driver.Decide(event.flow, result.Block(), verified);
         guard::Diagnostics::Line(std::string(result.Block() ? "[BLOCK]" : "[ALLOW]") + " flow=" + std::to_string(event.flow) +
             " pid=" + std::to_string(event.process_id) + " rule=" + rule + " file=\"" + guard::Diagnostics::Utf8(result.path) +
             "\" open_file_handles=" + std::to_string(result.handles) + " scanned_files=" + std::to_string(result.files) +
             " scanned_bytes=" + std::to_string(result.bytes) + " recent_files=" + std::to_string(result.recent_files) +
-            " file_evidence=" + (result.recent_match ? "recent-file-open" : "open-handle") + " detail=" + result.detail +
+            " file_evidence=" + ((event.flags & guard::NetData) != 0 ? "observed-file-read" : "observed-file-open") + " detail=" + result.detail +
+            (verified ? " verdict_scope=data-flow" : " verdict_scope=indication") +
             (accepted ? " decision=accepted" : " decision=stale-or-failed error=" + std::to_string(GetLastError())));
     }
 };

@@ -1,17 +1,19 @@
 # WFP FTP Guard PoC
 
-Windows x64 lab PoC that recognizes plaintext FTP on any TCP port and blocks a
-confirmed FTP flow when the client has a file whose name or raw content contains
-`secret` (case-insensitive substring). It scans open disk-file handles; default
-combined mode also checks bounded ETW history of files opened since connection
-start at each recognized upload command. The file need not be the upload source.
+Windows x64 lab PoC for on-demand file inspection during FTP transfers. It covers
+client uploads and remote pulls from a local FTP server, on arbitrary TCP ports.
+WFP holds traffic while the console scans observed source paths for `secret` in
+the filename or raw content (case-insensitive). It uses file-open/read evidence,
+without AFA or an application allow list. Explicit FTPS is recognized before the
+TLS upgrade; later data-flow enforcement uses conservative process/peer and file
+I/O correlation. TLS is not decrypted. See the coverage limits below.
 
 ## Binaries
 
 | Output | Role |
 | --- | --- |
 | `Debug/ftp-guard.exe` | Elevated console, driver loader, temporary WFP filters, ETW consumer, file policy and diagnostics. |
-| `driver/WfpFtpGuard.sys` | WFP callouts: identify the application/flow, recognize FTP bytes, hold/reinject commands and enforce decisions. It does not scan files. |
+| `driver/WfpFtpGuard.sys` | WFP callouts: identify inbound/outbound flows, recognize FTP, correlate data flows, hold/reinject traffic and enforce decisions. It does not scan files or decrypt TLS. |
 | `Debug/ftp-traffic.exe` | Synthetic client/server for controlled protocol tests; it does not perform real file transfers. |
 | `Debug/guard-tests.exe` | Unit/regression runner; no live driver or ETW session. |
 | `Debug/file-scanner.lib` | Static library linked into the console and unit runner; no separate deployment. |
@@ -34,23 +36,22 @@ config:
     useMaxWidth: true
 ---
 flowchart TB
-    App["Client application<br/>Real client or ftp-traffic.exe"]
-    Driver["WfpFtpGuard.sys<br/>IPv4 / IPv6 TCP<br/>FTP probe / upload gate<br/>Reinject / abort"]
-    Peer["Server<br/>FTP / SFTP / other"]
+    App["Protected application<br/>FTP client or server"]
+    Driver["WfpFtpGuard.sys<br/>Inbound / outbound TCP<br/>FTP control / data gate<br/>Reinject / abort"]
+    Peer["Peer application<br/>Local or remote"]
     Console["ftp-guard.exe<br/>NetDriverSession / policy<br/>SCM / filters / IOCTLs<br/>Diagnostics / correlation"]
-    Scan["FileScanner<br/>Open handles + recent files<br/>Secret / incomplete: block"]
+    Scan["FileScanner<br/>Observed source paths<br/>Secret / incomplete: block"]
     ETW["ETW providers<br/>TCP/IP / WinINet / FileIo"]
-    History["Recent file opens<br/>PID + connection start<br/>30 seconds / 1024 records<br/>Flush + delivery signal"]
+    History["File opens / reads<br/>PID / object / time<br/>Bounded recent history<br/>Flush + delivery signal"]
     Tests["guard-tests.exe<br/>User-mode regression tests"]
     App <-->|"TCP"| Driver
     Driver <-->|"Stream"| Peer
     Driver <-->|"Events / IOCTLs"| Console
     Console -->|"FTP: inspect PID"| Scan
-    App -. "Open handles" .-> Scan
     Scan -->|"Decision"| Driver
     ETW -. "TCP / API metadata" .-> Console
-    ETW -. "FileIo Create" .-> History
-    History -. "At upload gate" .-> Scan
+    ETW -. "FileIo lifetime / read" .-> History
+    History -. "At transfer gate" .-> Scan
     Tests -. "Tests" .-> Scan
     style Driver fill:#fff1cf,stroke:#ad7500,color:#493300
     style ETW fill:#f1ebff,stroke:#7953a4,color:#432b60
@@ -75,11 +76,13 @@ identifies where the code runs; no class instance is created.
 | **`NetDriverSession`** | Owns the console's connection to the driver. Loads the `.sys` through Windows services, installs temporary WFP filters, opens the driver device, exchanges IOCTL messages, and drains/unloads everything during cleanup. | `ftp-guard.exe` |
 | **`Driver`** - `driver/driver.cpp` | Kernel-side implementation. Registers WFP callouts, associates connections with processes, inspects TCP stream bytes, holds commands pending inspection, reinjects allowed data, and aborts blocked flows. Also manages queues, timeouts, injection completion and connection teardown. | `WfpFtpGuard.sys` |
 | **`FtpProbe`** | Recognizes the initial plaintext FTP exchange from greeting and command bytes. Handles fragmented input and returns `Unknown`, `Ftp`, or `Other`. It uses a bounded parser without dynamic allocation, so it can run inside the driver. | `WfpFtpGuard.sys` - one per tracked flow; `guard-tests.exe` - parser tests |
-| **`FtpUploadProbe`** | Watches subsequent commands on a confirmed FTP connection. Detects `STOR`, `APPE`, and `STOU` so an earlier allow does not authorize every later upload. Reuses `FtpProbe`'s command parsing and stops plaintext inspection after `AUTH TLS`. | `WfpFtpGuard.sys` - one per tracked flow; `guard-tests.exe` - parser tests |
-| **`FileScanner`** | Examines the originating process's open disk-file handles and supplied recent-file paths. Checks process creation time to guard against PID reuse, checks filenames, reads content with independent offsets, and returns a clear, secret-name, secret-content, or incomplete result. | `ftp-guard.exe` and `guard-tests.exe`, through `file-scanner.lib` |
+| **`NetFtpTransferProbe`** | Watches `STOR`/`APPE`/`STOU`, `RETR`, and `AUTH TLS`/`AUTH SSL`. Tracks the requested transfer direction and stops parsing after the TLS request. | `WfpFtpGuard.sys` - one per tracked flow; `guard-tests.exe` |
+| **`NetTransferGate`** | Determines whether the local client/server is a file sender. Explicit FTPS candidates gate outgoing indications because encrypted commands hide transfer direction. Retained grants are allowed only for plaintext data connections. Zero-length FIN does not trigger scanning. | `WfpFtpGuard.sys`, `ftp-guard.exe` and `guard-tests.exe` |
+| **`FileScanner`** | Checks process creation time, reopens observed source paths, checks filenames, and scans content with independent offsets. Returns clear, secret-name, secret-content, or incomplete. Its older all-handle scan remains available to regression tests; live transfer decisions use source paths to avoid unrelated Windows resources. | `ftp-guard.exe` and `guard-tests.exe`, through `file-scanner.lib` |
 | **`SecretMatcher`** | Searches content chunks for case-insensitive `secret` byte patterns in ASCII/UTF-8 and UTF-16 LE/BE. Retains partial matches between chunks, so a match can cross a read boundary. It performs matching only; `FileScanner` opens and reads files. | `ftp-guard.exe` and `guard-tests.exe` |
-| **`EtwMonitor`** | Owns the ETW sessions and consumer threads. Collects TCP connection metadata, optional WinINet FTP intent, and file-open events. Correlates TCP observations with WFP flows and supplies recent-file evidence at upload gates. It also flushes the trace and checks delivery completeness. | `ftp-guard.exe` |
+| **`EtwMonitor`** | Owns ETW sessions/threads. Collects TCP metadata, optional WinINet intent, and FileIo create/read/close events. Supplies opened paths at upload-command gates and read paths at data gates. Flushes the trace and checks delivery completeness. | `ftp-guard.exe` |
 | **`NetFileActivityCache`** | Stores up to 1,024 file-open records. Returns deduplicated paths for the requested PID, opened since the connection began and within the last 30 seconds. It stores evidence of opens, rather than keeping file handles alive. | `ftp-guard.exe` - owned by `EtwMonitor`; `guard-tests.exe` - cache tests |
+| **`NetFileReadCache`** | Maps up to 4,096 live file objects to their owning PID/path. Records reads in a separate 1,024-record, 30-second history. Handles object reuse/close and reports eviction. A read is evidence of file activity, not proof of a particular transfer. | `ftp-guard.exe` - owned by `EtwMonitor`; `guard-tests.exe` |
 | **`NetTraceProgress`** | Synchronizes ETW delivery using a mutex, condition variable, consumed-buffer counter and completion flag. Inspection waits for the required buffer count, consumer shutdown, or timeout. This replaces the guessed fixed sleep; inspection remains serial. | `ftp-guard.exe` - owned by each ETW session; `guard-tests.exe` - synchronization tests |
 | **`Diagnostics`** | Formats connection/application details, converts strings and addresses, and writes synchronized console messages. It produces the application blobs visible in the screenshots. | `ftp-guard.exe` |
 | **`WinHandle`** | Move-only owner of a Windows `HANDLE`. Automatically closes process, file, token and event handles when their owners leave scope. | `ftp-guard.exe` and `guard-tests.exe` |
@@ -91,6 +94,7 @@ The test executables contain three additional classes:
 | **`Traffic`** - `tests/traffic.cpp` | Implements `ftp-traffic.exe`: the synthetic client and minimal loopback server used for protocol, fragmentation, IPv6, HTTP and controlled open-file tests. | `ftp-traffic.exe` |
 | **`Traffic::Socket`** | Private socket owner that automatically calls `closesocket`. | `ftp-traffic.exe` |
 | **`Tests`** - `tests/unit.cpp` | Runs `guard-tests.exe`: parser, matcher, cache, synchronization and real Windows file-handle regression tests. | `guard-tests.exe` |
+| **`FtpUploadProbe`** | Earlier upload-only parser retained for regression tests. The live driver now uses `NetFtpTransferProbe`. | `guard-tests.exe` |
 
 `file-scanner.lib` is a static library: its code becomes part of the consuming
 executable. Classes used by multiple binaries have independent instances in each
@@ -99,17 +103,24 @@ process.
 The shared protocol types are data records:
 
 - **`NetEventKind`** identifies flow, inspection, allow, block, error and closed-flow notifications.
-- **`NetEvent`** carries a notification, process identity, endpoints and command evidence.
-- **`NetDecision`** carries the console's allow/block reply for a flow.
+- **`NetEvent`** carries process identity, endpoints, role/TLS/data flags, control-flow correlation, file-evidence time and command-verb evidence.
+- **`NetDecision`** carries allow/block and an optional source-verified grant for one plaintext data connection (ABI version 3).
 - **`NetStatus`** carries driver counters and operating state.
 
 For an ordinary `ftp.exe` upload, the interaction is:
 
-1. `Driver` uses `FtpProbe` to identify FTP and `FtpUploadProbe` to catch `STOR`.
+1. `Driver` uses `FtpProbe` to identify FTP and `NetFtpTransferProbe` to catch `STOR`.
 2. `Console` receives the inspection request through `NetDriverSession`.
 3. `EtwMonitor`, `NetTraceProgress` and `NetFileActivityCache` supply the recent-file evidence.
-4. `FileScanner` checks current handles and recent paths, using `SecretMatcher` for content.
+4. `FileScanner` checks observed paths, using `SecretMatcher` for content.
 5. `Console` sends the decision through `NetDriverSession`; `Driver` releases or aborts the flow, and the console reports the outcome.
+6. Outgoing data receives fresh read-based inspection. A clear plaintext source verdict releases that data connection; a later transfer opens a new one and is checked again. FTPS keeps inspecting later outgoing indications, so a public certificate read cannot authorize a subsequent upload.
+
+For a server-side pull, incoming `RETR` reaches the server so it can open the
+source. The driver holds its outgoing data; FileIo read evidence selects paths
+for inspection. Active-mode data can be outbound even though control is inbound.
+Explicit FTPS retains the application role after `AUTH TLS`/`AUTH SSL`, but the
+encrypted `RETR`/`STOR` commands and negotiated data ports are unavailable.
 
 ## Run and modes
 
@@ -117,10 +128,13 @@ After [building and signing](TEST_RESULTS.md#build-and-test-instructions), run e
 
 ```powershell
 .\build\Debug\ftp-guard.exe --driver .\build\driver\WfpFtpGuard.sys --app C:\Windows\System32\ftp.exe
+# Protect a local server instead:
+.\build\Debug\ftp-guard.exe --driver .\build\driver\WfpFtpGuard.sys --app "C:\Program Files\SFTPGo\sftpgo.exe"
 ```
 
 Omit `--app` to cover all applications; it otherwise selects the full executable
-path. `--seconds N` sets a run limit. Ctrl+C/normal exit removes filters and
+path. `--seconds N` sets a run limit; `--stop-event Local\name` supports orderly
+test-controller shutdown. Ctrl+C/normal exit removes filters and
 unloads the driver; stopping aborts tracked flows. One console may own the driver.
 
 | Capability | `--etw-only` | `--no-etw` | Default combined |
@@ -128,35 +142,40 @@ unloads the driver; stopping aborts tracked flows. One console may own the drive
 | TCP PID/endpoints on any port | Trace candidates | WFP flows | Both, correlated by PID + full tuple |
 | Plaintext FTP classification | No generic classifier; WinINet API intent if emitted | WFP byte probe | WFP byte probe |
 | Hold commands / block flows | No | Yes | Yes |
-| Open-handle file policy | No | Yes | Yes |
-| Recently opened, now closed files at upload gates | No | No | Bounded FileIo history |
+| On-demand source-file policy | No | Required evidence is incomplete; transfer gates block | Bounded FileIo open/read history |
+| Local server pulls / explicit FTPS candidates | Telemetry only | No complete file evidence | Correlated data-flow inspection, subject to limits |
 
 TCP/WinINet ETW has no payload and cannot generally distinguish FTP from SFTP.
 WinINet FTP events depend on the client/provider and may be absent. ETW-only is
 telemetry, without file inspection or enforcement. Combined mode adds independent
 network observations and recent file paths; a driver FTP event is still required
-before file policy runs.
+before file policy runs. ETW is file evidence here, without AFA; it is not the
+FTP classifier or the blocking mechanism.
 
 Windows `ftp.exe` briefly opens its source before `STOR`, closes that probe handle,
 and reopens it after server acceptance. Combined mode covers this tested gap by
 rechecking `STOR`/`APPE`/`STOU` and inspecting recent paths. It explicitly flushes
-ETW, then waits on a condition variable for consumed buffers, with a two-second
-deadline and shutdown notification. There is no fixed sleep in that wait.
+ETW, then waits on a condition variable for consumed buffers, with a four-second
+deadline and shutdown notification. A delayed consumer triggers one conditional
+reflush against the original buffer target. There is no fixed sleep in that wait.
 Reported trace loss, delivery timeout or scanner failure blocks conservatively
-as `inspection-incomplete`. With ETW disabled/unavailable, enforcement continues
-with narrower open-handle coverage and can miss this native-client source.
+as `inspection-incomplete`. With ETW disabled/unavailable, transfer gates block
+because source evidence is incomplete. Unrelated open handles do not substitute
+for a source-file observation.
 
 ## Key limits
 
-- Covers newly established outbound IPv4/IPv6 TCP, using bounded application
+- Covers newly established inbound/outbound IPv4/IPv6 TCP, using bounded application
   control-byte heuristics. TCP establishment/greeting can precede identification.
-  Existing connections, inbound-initiated flows, unusual/slow starts and protocol
+  Existing connections, unusual/slow starts and protocol
   ambiguity remain outside reliable coverage.
 - SFTP and implicit FTPS are not inspected as FTP. Encrypted outer tunnel bytes
   cannot be classified as FTP; the inner application stream may still be visible
   before VPN encryption (see [coexistence](#kdf-vpn-and-wfp-coexistence)). Explicit
-  `AUTH TLS` can be recognized before encryption; later encrypted commands cannot.
-  Control/data channels are not linked, and network file payloads are not scanned.
+  `AUTH TLS`/`AUTH SSL` can be recognized before encryption. Data-flow association
+  uses the same process and peer, not decrypted port negotiation. Parallel sessions,
+  helpers, alternate data peers and unrelated TCP traffic can defeat or confuse it.
+  Network file payloads are not directly scanned.
 
   Regarding SFTP - the key limitation is encryption: a network filter can
   recognize SSH, but the request that specifically identifies SFTP travels
@@ -165,14 +184,23 @@ with narrower open-handle coverage and can miss this native-client source.
 - Raw file matching covers ASCII/UTF-8 and UTF-16 LE/BE patterns, without document
   parsing, archive unpacking or decryption. Only the filename is checked, excluding
   parent folders. Protected/unreadable/network files can cause conservative blocks.
-- Handle snapshots and file reads are not atomic. Recent paths are reopened and
+- Explicit FTPS coverage is conditional. Unattributed outgoing indications pass
+  for TLS-handshake compatibility; cached, mapped or memory-generated transfers
+  without observed reads can therefore escape file inspection. The log reports
+  `[COVERAGE]` without claiming a content verdict. This is not generic FTPS DLP
+  or a no-leak guarantee. Implicit FTPS remains outside FTP qualification.
+- A positive plaintext source verdict is scoped to one data connection, assuming ordinary
+  FTP stream mode with a new data connection per transfer. Reused data connections,
+  subsequent source changes and alternative transfer modes need further work.
+- File reads are not atomic. Recent paths are reopened and
   may have changed, disappeared or come from unsuccessful open attempts. Missing,
   expired or evicted events can miss files; unrelated open/recent files can block
-  a transfer. Recent evidence does not prove a handle remains open or prove which
-  file is being uploaded.
+  a transfer. Plain FTP data without an observed source read blocks as incomplete.
+  Recent evidence does not prove an exact file-to-transfer mapping.
 - Bounds: 64 tracked flows, 256 KiB queued bytes per flow, 512-byte probe input per
   indication, 3-second initial probe, 15-second driver decision timeout and
-  8-second file-scan budget. Capacity/allocation failures can leave flows untracked;
+  8-second file-scan budget. File-object and evidence eviction blocks conservatively.
+  Capacity/allocation failures can leave flows untracked;
   unclassified traffic is allowed. Serial inspection, native ETW flush and file I/O
   can delay other flows or overrun a budget. This is a lab PoC, without production
   throughput, stability or evasion guarantees.
@@ -203,11 +231,10 @@ for coexistence with other WFP drivers and TCP redirection
 ([CSCwo25750](https://www.cisco.com/c/en/us/td/docs/security/vpn_client/anyconnect/Cisco-Secure-Client-5/release/notes/release-notes-cisco-secure-client-5-1.html)).
 The PoC's chosen ordering has not been qualified against KDF.
 
-**Current PoC concern:** [FlowClassify](driver/driver.cpp) returns when
-`FWPS_RIGHT_ACTION_WRITE` is absent, before associating its flow context.
-Because stream callouts use `FWP_CALLOUT_FLAG_CONDITIONAL_ON_FLOW`, skipping that
-association can leave the connection uninspected. This is a potential coexistence
-blind spot to investigate, not a demonstrated KDF failure or a completed fix.
+The updated [FlowClassify](driver/driver.cpp) preserves flow association when
+`FWPS_RIGHT_ACTION_WRITE` is absent, without changing the action in that case.
+This removes the earlier early-return concern. It does not establish KDF
+compatibility; the combined driver/VPN configuration still needs live validation.
 
 Compatibility validation must inspect installed providers/layers/sublayer weights
 and repeat real FTP allow/block tests with KDF loaded: VPN disconnected/connected,

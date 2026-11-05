@@ -21,7 +21,7 @@ NetDriverSession::NetDriverSession(const std::wstring& driver_path, const std::w
         if (!device_.Valid()) { Check(GetLastError(), "Open driver device"); }
         if (ReadStatus().stopping != 0) { throw std::runtime_error("Driver is stopping; restart the loader"); }
         AddFilters(application);
-        Diagnostics::Line("[DRIVER] loaded; IPv4/IPv6 outbound TCP streams monitored on all ports");
+        Diagnostics::Line("[DRIVER] loaded; IPv4/IPv6 inbound/outbound TCP streams monitored on all ports");
     } catch (...) { Shutdown(); throw; }
 }
 
@@ -87,23 +87,19 @@ void NetDriverSession::AddFilters(const std::wstring& application) {
             filter.weight.uint8 = 10;
             filter.action.type = i < 2 ? FWP_ACTION_CALLOUT_INSPECTION : FWP_ACTION_CALLOUT_UNKNOWN;
             filter.action.calloutKey = *keys[i];
-            std::array<FWPM_FILTER_CONDITION0, 3> conditions{};
+            std::array<FWPM_FILTER_CONDITION0, 2> conditions{};
             if (i < 2) {
                 conditions[0].fieldKey = FWPM_CONDITION_IP_PROTOCOL;
                 conditions[0].matchType = FWP_MATCH_EQUAL;
                 conditions[0].conditionValue.type = FWP_UINT8;
                 conditions[0].conditionValue.uint8 = IPPROTO_TCP;
-                conditions[1].fieldKey = FWPM_CONDITION_DIRECTION;
-                conditions[1].matchType = FWP_MATCH_EQUAL;
-                conditions[1].conditionValue.type = FWP_UINT32;
-                conditions[1].conditionValue.uint32 = FWP_DIRECTION_OUTBOUND;
-                filter.numFilterConditions = 2;
+                filter.numFilterConditions = 1;
                 if (app_id != nullptr) {
-                    conditions[2].fieldKey = FWPM_CONDITION_ALE_APP_ID;
-                    conditions[2].matchType = FWP_MATCH_EQUAL;
-                    conditions[2].conditionValue.type = FWP_BYTE_BLOB_TYPE;
-                    conditions[2].conditionValue.byteBlob = app_id;
-                    filter.numFilterConditions = 3;
+                    conditions[1].fieldKey = FWPM_CONDITION_ALE_APP_ID;
+                    conditions[1].matchType = FWP_MATCH_EQUAL;
+                    conditions[1].conditionValue.type = FWP_BYTE_BLOB_TYPE;
+                    conditions[1].conditionValue.byteBlob = app_id;
+                    filter.numFilterConditions = 2;
                 }
                 filter.filterCondition = conditions.data();
             }
@@ -130,8 +126,8 @@ bool NetDriverSession::Next(NetEvent& event) {
     return false;
 }
 
-bool NetDriverSession::Decide(UINT64 flow, bool block) {
-    const NetDecision decision{kVersion, block ? 1UL : 0UL, flow};
+bool NetDriverSession::Decide(UINT64 flow, bool block, bool source_verified) {
+    const NetDecision decision{kVersion, block ? 1UL : 0UL, flow, source_verified ? 1UL : 0UL, 0};
     DWORD returned = 0;
     return DeviceIoControl(device_.Get(), kSetDecision, const_cast<NetDecision*>(&decision), sizeof(decision), nullptr, 0, &returned, nullptr) != FALSE;
 }

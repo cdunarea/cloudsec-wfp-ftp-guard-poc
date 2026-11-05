@@ -12,7 +12,7 @@ class NetDriverSession {
     NetDriverSession(const NetDriverSession&) = delete;
     NetDriverSession& operator=(const NetDriverSession&) = delete;
     bool Next(NetEvent& event);
-    bool Decide(UINT64 flow, bool block);
+    bool Decide(UINT64 flow, bool block, bool source_verified = false);
     NetStatus ReadStatus() const;
  private:
     SC_HANDLE manager_ = nullptr;
