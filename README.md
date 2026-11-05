@@ -195,8 +195,8 @@ for a source-file observation.
   FTP stream mode with a new data connection per transfer. Reused data connections,
   subsequent source changes and alternative transfer modes need further work.
 - File reads are not atomic. Recent paths are reopened and
-  may have changed, disappeared or come from unsuccessful open attempts. Missing,
-  expired or evicted events can miss files; unrelated open/recent files can block
+  may have changed or disappeared. Missing,
+  expired or evicted events can miss files; unrelated recent reads can block
   a transfer. Plain FTP data without an observed source read blocks as incomplete.
   Recent evidence does not prove an exact file-to-transfer mapping.
 - Blocking file content does not prevent a client or server from creating an

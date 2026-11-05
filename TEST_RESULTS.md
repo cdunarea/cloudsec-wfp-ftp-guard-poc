@@ -1,7 +1,161 @@
 # Test results and reproduction
 
-Latest validation: **corrective end-to-end tests on W11Test, 2026-11-05 UTC**.
+Latest validation: **native Windows Explorer FTP and FTP/FTPS regressions on W11Test, 2026-11-05 UTC**.
 Source: C:\dev\sbg-poc\cloudsec-wfp-ftp-guard-poc on DEV-11x64.
+
+## Windows Explorer: live FTP against SFTPGo
+
+**All 10 Explorer matrix cases passed.** These were actual File Explorer FTP
+folder copy/paste operations. No curl, WinINet test tool or .NET transfer was
+substituted for Explorer. Two public transfers also passed with the driver absent.
+
+All live transfers and driver loading ran exclusively on **W11Test**.
+DEV-11x64 was used for source changes, non-elevated CMake builds and unit tests.
+The server was the existing SFTPGo service, using plain FTP on loopback port 21.
+Loopback simulates the remote-client role in the protected-server cases.
+
+### Environment and assertions
+
+| Item | Verified value |
+| --- | --- |
+| Windows | W11Test, Windows 11 Pro, 10.0.26300 |
+| Explorer | Microsoft-signed explorer.exe, version 10.0.26100.8117 |
+| Explorer SHA-256 | EEE089FE6F927C7F0D51B0ABD9D70C094157E33673AD760713EC7B1CEA18EE11 |
+| Server | SFTPGo 2.7.6, existing local root account |
+| FTP mode | Native Explorer FTP folders; passive data connections |
+| Process attribution | Explorer frame PID, executable path and established FTP TCP owner recorded for every case |
+| Process/flow isolation | A fresh Explorer process and FTP connection for each matrix case |
+| Cold start | First paste occurred about 2-3 seconds after launching Explorer; no warm-up sleep |
+
+An allowed case required the complete receiver length, matching source/receiver
+SHA-256, an accepted source-read allow decision, and no native copy error.
+A denied case required an accepted secret rule naming the intended source,
+zero receiver file bytes at the check, and Explorer's native copy-error dialog.
+An inspection-incomplete block did not count as a successful secret detection.
+
+### Explorer matrix
+
+| Protected sender | Explorer operation | Public, 1 MiB | Public, 100 MiB | Secret filename, 1 MiB | Secret at EOF, 1 MiB | Secret at EOF, 100 MiB |
+| --- | --- | --- | --- | --- | --- | --- |
+| explorer.exe | Upload to SFTPGo | Allow; hash matched | Allow; hash matched | Block; receiver absent | Block; receiver absent | Block; receiver absent |
+| sftpgo.exe | Download/pull into Explorer | Allow; hash matched | Allow; hash matched | Block; receiver absent | Block; receiver absent | Block; receiver absent |
+
+The content marker was the mixed-case ASCII word SeCrEt in the final six bytes.
+Its offset was 1,048,570 for the 1 MiB source and 104,857,594 for the 100 MiB
+source. The content filenames themselves did not contain the secret keyword.
+Each content verdict named that source, rather than an unrelated process file.
+
+SFTPGo's upload logs independently report **zero received bytes** for all three
+blocked Explorer uploads. Its failed protected-server downloads report 98,304
+bytes in the server send path. That is not a receiver-delivery measurement.
+It is consistent with Windows buffering writes before the stream verdict.
+It must not be presented as proof that those bytes reached Explorer.
+
+All six denied matrix receivers were absent when checked after the copy failed.
+This does not prove that an empty entry was never created and removed.
+The driver holds outgoing file data for the source verdict, but this run did not
+record an independent packet capture proving zero payload delivery for every
+server pull. FTP commands, connection setup and replies are allowed to precede
+a file-data block.
+
+### Corrections made during this run
+
+| Finding | Correction |
+| --- | --- |
+| Old or unrelated file-history eviction permanently poisoned later inspections | Expire old entries before enforcing capacity. Check lost evidence by PID and relevant time window. Keep a conservative fallback if the bounded loss index also fills. Missing live-object mappings still fail closed. |
+| Failed shell DLL lookups were treated as successful file opens | Match FileIo/Create with successful FileIo/OpEnd by IRP. Failed attempts produce no source evidence. Missing completion status and correlation overflow remain conservative. |
+| Control-command scans treated shell resource/metadata opens as upload sources | Qualify and release the FTP control command. Keep the separate outgoing data flow held. Inspect actual source-read evidence at that data gate. Releasing STOR does not grant the data connection. |
+| An open failure could display the last successfully scanned path | Preserve the failing path in incomplete-inspection diagnostics. |
+
+There is no Explorer allow bypass or hardcoded system-file exemption.
+Sensitive-file policy still runs on the outgoing data flow.
+
+```mermaid
+sequenceDiagram
+    participant E as Explorer
+    participant W as WFP driver
+    participant G as Guard console
+    participant S as SFTPGo
+    E->>W: FTP control and STOR
+    W->>G: Qualified control command
+    G-->>W: Allow command only
+    W->>S: STOR
+    S-->>E: Ready for data
+    E->>E: Read source file
+    E->>W: First outgoing file bytes
+    Note over W: Hold file data
+    W->>G: Inspect sender and data flow
+    G->>G: Flush ETW; confirm opens and reads; scan source
+    alt Source clear
+        G-->>W: Allow this plaintext data flow
+        W->>S: Reinject held file bytes
+    else Secret or incomplete evidence
+        G-->>W: Block
+        W-->>E: Abort data flow
+    end
+```
+
+For a protected local server, the sender roles reverse. Explorer sends RETR.
+SFTPGo opens and reads its local source. WFP holds SFTPGo's outgoing data while
+the console scans that source. The client's receiving process remains Explorer.
+
+### Final-build regression and build validation
+
+| Additional group | Passed / cases |
+| --- | ---: |
+| Native ftp.exe, plain FTP, client/server active mode | 7 / 7 |
+| Reference curl, plain FTP | 7 / 7 |
+| Reference curl, explicit FTPS with protected data | 12 / 12 |
+| Reference curl, explicit FTPS with clear data | 7 / 7 |
+| .NET explicit-FTPS server pulls | 3 / 3 |
+| Total existing real-transfer regression matrix | 36 / 36 |
+| Missing source evidence, native client/server plain FTP | 2 / 2 blocked as incomplete |
+| Actual-console screenshot replays, 100 MiB | 4 / 4 |
+
+The regression used 1 MiB fixtures, ports 21 and 49237, active/passive data,
+client/server roles, filename/content blocks, and file data beginning with an
+FTP-looking greeting. The reference curl was 8.23.0 / LibreSSL 4.4.0.
+Windows-supplied curl/Schannel was not requalified by this run; its earlier
+compatibility finding below remains separate.
+
+Debug and Release CMake builds and CTest passed, non-elevated.
+The unit runner completed **15,936 assertions with zero failures**.
+File activity/open-correlation line coverage was 97/98; the one unhit line is
+an existing loop-closing brace. All added cache/open-correlation lines were hit.
+File-scanner coverage was 201/217 lines. This is not a claim of full branch or
+whole-program coverage. The console/ETW integration is exercised by live tests.
+
+### Evidence and scope
+
+Sanitized evidence is stored on W11Test under:
+
+```text
+C:\dev\tests\Explorer-FTP-20261105T051017Z
+```
+
+It contains per-case receiver assertions, process/TCP attribution, accepted
+decision logs, native Explorer UI captures, build metadata and regression results.
+Console screenshots show actual interactive ftp-guard.exe output on W11Test.
+They are separate 100 MiB upload/download replays, rather than reconstructed
+console images or transfers made by a substitute client.
+
+| Console image | What it shows |
+| --- | --- |
+| proof-client-public-console.png | Explorer upload; full source scan and accepted data-flow allow |
+| proof-client-content-console.png | Explorer upload; EOF content match and accepted block |
+| proof-server-public-console.png | Protected SFTPGo pull; full source scan and accepted allow |
+| proof-server-content-console.png | Protected SFTPGo pull; EOF content match and accepted block |
+
+The images were captured from visible console pixels and visually checked.
+Temporary tools, tasks, driver instances and transfer payloads are removed after
+collection. The SFTPGo service, requested account file and explicitly authorized
+Explorer saved login are preserved. Cleanup verification is recorded with the evidence.
+
+The Explorer cases cover **plain FTP**. They do not qualify Explorer as an
+explicit-FTPS client. Explicit FTPS was checked with the separate reference
+clients above. TLS is not decrypted by WFP. Existing FTPS attribution limits,
+bounded caches and conservative source correlation still apply.
+No AFA or application allow-list enforcement was added.
 
 ## Large-file live validation
 
@@ -452,7 +606,7 @@ The remote/simulated client is recorded separately. For uploads, the protected
 application is **ftp.exe** or **curl.exe**. Connection initiator and logical FTP
 role are separate: an active-mode server opens an outbound data connection.
 
-### What the current implementation does
+### Implementation at that earlier checkpoint
 
 1. Associate inbound/outbound TCP flows with their owning process.
 2. Recognize clear FTP commands, including `AUTH TLS` and `AUTH SSL`, without a port rule.
@@ -624,8 +778,10 @@ account file, and sanitized results remain.
 ## Historical evidence
 
 The following earlier explanation is retained verbatim. It describes the
-2026-11-03 CAL build. In the current implementation, initial FTP recognition is
-diagnostic; later command/data gates trigger source-path inspection.
+2026-11-03 CAL build. Current code qualifies control commands and inspects
+source-read paths at outgoing data gates, as described in the Explorer section
+above. The earlier command-gated behavior and receiver observations below are
+historical.
 
 ### What happens during ftp.exe client interactions with SFTPGo
 
